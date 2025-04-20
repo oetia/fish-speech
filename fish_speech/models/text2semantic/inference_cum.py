@@ -1285,21 +1285,22 @@ def main(
 
                     vqgan_inference(tokens_array, len(tokens), model=model_vqgan)
 
-                    new_wavs = list(map(lambda x: f"./temp/{x}", sorted(list(filter(lambda x: x.startswith("new"), os.listdir("./temp"))), key=lambda x: int(x.split(".")[0].split("-")[1]))))
-                    new_combined = AudioSegment.empty()
-                    for wav in new_wavs:
-                        print(wav)
-                        audio = AudioSegment.from_wav(wav)
-                        new_combined += audio  # Append
-                    new_combined.export("./temp/new-combined.wav", format="wav")
+    # combining to check quality of outputs
+    new_wavs = list(map(lambda x: f"./temp/{x}", sorted(list(filter(lambda x: x.startswith("new"), os.listdir("./temp"))), key=lambda x: int(x.split(".")[0].split("-")[1]))))
+    new_combined = AudioSegment.empty()
+    for wav in new_wavs:
+        print(wav)
+        audio = AudioSegment.from_wav(wav)
+        new_combined += audio  # Append
+    new_combined.export("./temp/.new-combined.wav", format="wav")
 
-                    ONLYnew_wavs = list(map(lambda x: f"./temp/{x}", sorted(list(filter(lambda x: x.startswith("ONLYnew"), os.listdir("./temp"))), key=lambda x: int(x.split(".")[0].split("-")[1]))))
-                    ONLYnew_combined = AudioSegment.empty()
-                    for wav in ONLYnew_wavs:
-                        print(wav)
-                        audio = AudioSegment.from_wav(wav)
-                        ONLYnew_combined += audio  # Append
-                    ONLYnew_combined.export("./temp/ONLYnew-combined.wav", format="wav")
+    ONLYnew_wavs = list(map(lambda x: f"./temp/{x}", sorted(list(filter(lambda x: x.startswith("ONLYnew"), os.listdir("./temp"))), key=lambda x: int(x.split(".")[0].split("-")[1]))))
+    ONLYnew_combined = AudioSegment.empty()
+    for wav in ONLYnew_wavs:
+        print(wav)
+        audio = AudioSegment.from_wav(wav)
+        ONLYnew_combined += audio  # Append
+    ONLYnew_combined.export("./temp/.ONLYnew-combined.wav", format="wav")
 
 
     end = time.time()
@@ -1309,10 +1310,3 @@ def main(
 if __name__ == "__main__":
     main()
 
-
-
-# api call
-# 
-
-# torch.Size([9, 8192])
-# is context truncated somehow?
