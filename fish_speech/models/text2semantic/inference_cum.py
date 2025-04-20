@@ -424,7 +424,7 @@ def generate(
     max_new_tokens: int,
     decode_one_token=decode_one_token_naive,
     **sampling_kwargs,
-) -> torch.Tensor:
+):
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
@@ -477,7 +477,8 @@ def generate(
     print(seq.shape)
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
-    x = decode_n_tokens(
+    # x = decode_n_tokens(
+    x_generator = decode_n_tokens(
         model,
         next_token.view(1, codebook_dim, -1),
         input_pos,
@@ -486,11 +487,21 @@ def generate(
         semantic_ids=semantic_ids,
         **sampling_kwargs,
     )
-    # x = torch.cat(generated_tokens, dim=1)
-    seq = seq[:, : T + 1 + x.size(1)]
-    seq[:, T + 1 :] = x
 
-    return seq
+    for x_gen in x_generator:
+        # print("xgen sanitycheck")
+        if x_gen[0] == "previous_token": # default functionality
+            seq = seq[:, : T + 1 + x_gen[1].size(1)]
+            seq[:, T + 1 :] = x_gen[1]
+            yield ("seq", seq)
+        elif x_gen[0] == "next_token": # keep passing it up
+            yield x_gen
+
+    # # x = torch.cat(generated_tokens, dim=1)
+    # seq = seq[:, : T + 1 + x.size(1)]
+    # seq[:, T + 1 :] = x
+    # return seq
+
 
 
 def decode_n_tokens_agent(
@@ -815,6 +826,7 @@ def generate_long(
     )
 
     for sample_idx in range(num_samples):
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -856,7 +868,8 @@ def generate_long(
             prompt_length = cat_encoded.size(1)
 
             t0 = time.perf_counter()
-            y = generate(
+            # y = generate(
+            y_generator = generate(
                 model=model,
                 prompt=cat_encoded,
                 max_new_tokens=max_new_tokens,
@@ -866,41 +879,47 @@ def generate_long(
                 repetition_penalty=repetition_penalty,
             )
 
-            if sample_idx == 0 and seg_idx == 0 and compile:
-                logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
+            for y_gen in y_generator:
+                # print("ygen sanity check")
+                if y_gen[0] == "seq":
+                    y = y_gen[1]
+                    if sample_idx == 0 and seg_idx == 0 and compile:
+                        logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
 
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
 
-            t = time.perf_counter() - t0
+                    t = time.perf_counter() - t0
 
-            tokens_generated = y.size(1) - prompt_length
-            tokens_sec = tokens_generated / t
-            logger.info(
-                f"Generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
-            )
-            logger.info(
-                f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s"
-            )
+                    tokens_generated = y.size(1) - prompt_length
+                    tokens_sec = tokens_generated / t
+                    logger.info(
+                        f"Generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
+                    )
+                    logger.info(
+                        f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s"
+                    )
 
-            if torch.cuda.is_available():
-                logger.info(
-                    f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
-                )
+                    if torch.cuda.is_available():
+                        logger.info(
+                            f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
+                        )
 
-            # Put the generated tokens
-            # since there is <im_end>, we remove last token
-            codes = y[1:, prompt_length + 1 :].clone()
-            assert (codes >= 0).all(), f"Negative code found"
+                    # Put the generated tokens
+                    # since there is <im_end>, we remove last token
+                    codes = y[1:, prompt_length + 1 :].clone()
+                    assert (codes >= 0).all(), f"Negative code found"
 
-            decoded = y[:, prompt_length:].clone()
-            # But for global encoding, we should keep the <im_end> token
+                    decoded = y[:, prompt_length:].clone()
+                    # But for global encoding, we should keep the <im_end> token
 
-            global_encoded.append(decoded)
-            assert (codes >= 0).all(), f"Negative code found: {codes}"
-            yield GenerateResponse(action="sample", codes=codes, text=texts[seg_idx])
-            seg_idx += 1
-
+                    global_encoded.append(decoded)
+                    assert (codes >= 0).all(), f"Negative code found: {codes}"
+                    yield GenerateResponse(action="sample", codes=codes, text=texts[seg_idx])
+                    seg_idx += 1
+                elif y_gen[0] == "next_token":
+                    # print("ygen - yielded next token")
+                    yield y_gen
         # This indicates the end of the current sample
         yield GenerateResponse(action="next")
 
@@ -1117,23 +1136,40 @@ def main(
     idx = 0
     codes = []
 
+    tokens = []
+
     print("starting generation")
     start = time.time()
     for response in generator:
-        if response.action == "sample":
-            codes.append(response.codes)
-            logger.info(f"Sampled text: {response.text}")
-        elif response.action == "next":
-            if codes:
-                codes_npy_path = os.path.join(output_dir, f"codes_{idx}.npy")
-                np.save(codes_npy_path, torch.cat(codes, dim=1).cpu().numpy())
-                logger.info(f"Saved codes to {codes_npy_path}")
-            logger.info(f"Next sample")
-            codes = []
-            idx += 1
+        # print("response sanitycheck", response)
+        # print(response)
+        if isinstance(response, GenerateResponse):
+            if response.action == "sample":
+                codes.append(response.codes)
+                logger.info(f"Sampled text: {response.text}")
+            elif response.action == "next":
+                if codes:
+                    codes_npy_path = os.path.join(output_dir, f"codes_{idx}.npy")
+                    np.save(codes_npy_path, torch.cat(codes, dim=1).cpu().numpy())
+                    logger.info(f"Saved codes to {codes_npy_path}")
+                    print("torch final dim: ", torch.cat(codes, dim=1).shape)
+
+                    tokens_array = np.concatenate(tokens, axis=1)
+                    print("tokens final dim: ", tokens_array.shape)
+                logger.info(f"Next sample")
+                codes = []
+                idx += 1
+            else:
+                logger.error(f"Error: {response}")
         else:
-            logger.error(f"Error: {response}")
+            if response[0] == "next_token":
+                tokens.append(response[1][1:, :].cpu().numpy())
+                if len(tokens) % 10 == 0: # on every tenth token do a generation
+                    tokens_array = np.concatenate(tokens, axis=1)
+                    # print(tokens_array.shape)
+                # print("sanity check")
     end = time.time()
+
     print(f"finished generation: time taken: {end - start}")
 
 
