@@ -1077,6 +1077,7 @@ def main(
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
 
+
     generator = generate_long(
         model=model,
         device=device,
@@ -1097,6 +1098,8 @@ def main(
     idx = 0
     codes = []
 
+    print("starting generation")
+    start = time.time()
     for response in generator:
         if response.action == "sample":
             codes.append(response.codes)
@@ -1111,6 +1114,8 @@ def main(
             idx += 1
         else:
             logger.error(f"Error: {response}")
+    end = time.time()
+    print(f"finished generation: time taken: {end - start}")
 
 
 if __name__ == "__main__":

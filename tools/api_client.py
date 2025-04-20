@@ -1,3 +1,6 @@
+import time
+
+start = time.time()
 import argparse
 import base64
 import wave
@@ -10,6 +13,9 @@ from pydub.playback import play
 
 from fish_speech.utils.file import audio_to_bytes, read_ref_text
 from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
+stop = time.time()
+
+print("imports took", stop - start)
 
 
 def parse_args():
@@ -130,7 +136,10 @@ def parse_args():
 
 if __name__ == "__main__":
 
+    start = time.time()
     args = parse_args()
+
+    # print(args.reference_audio, args.reference_text)
 
     idstr: str | None = args.reference_id
     # priority: ref_id > [{text, audio},...]
@@ -149,6 +158,8 @@ if __name__ == "__main__":
         byte_audios = []
         ref_texts = []
         pass  # in api.py
+
+    
 
     data = {
         "text": args.text,
@@ -169,9 +180,11 @@ if __name__ == "__main__":
         "use_memory_cache": args.use_memory_cache,
         "seed": args.seed,
     }
+    stop = time.time()
+    print("time taken for initial setup:", stop - start)
 
     pydantic_data = ServeTTSRequest(**data)
-
+    start = time.time()
     response = requests.post(
         args.url,
         data=ormsgpack.packb(pydantic_data, option=ormsgpack.OPT_SERIALIZE_PYDANTIC),
@@ -181,6 +194,8 @@ if __name__ == "__main__":
             "content-type": "application/msgpack",
         },
     )
+    stop = time.time()
+    print(f"request post time", stop - start)
 
     if response.status_code == 200:
         if args.streaming:
@@ -196,9 +211,9 @@ if __name__ == "__main__":
             wf.setframerate(args.rate)
 
             stream_stopped_flag = False
-
+            start = time.time()
             try:
-                for chunk in response.iter_content(chunk_size=1024):
+                for chunk in response.iter_content(chunk_size=16384):
                     if chunk:
                         stream.write(chunk)
                         wf.writeframesraw(chunk)
@@ -210,15 +225,23 @@ if __name__ == "__main__":
                 stream.close()
                 p.terminate()
                 wf.close()
+            stop = time.time()
+            print(f"chunk thing took", stop - start)
         else:
+            start = time.time()
             audio_content = response.content
             audio_path = f"{args.output}.{args.format}"
             with open(audio_path, "wb") as audio_file:
                 audio_file.write(audio_content)
+            stop = time.time()
+            print("saving file took:", stop - start)
 
+            start = time.time()
             audio = AudioSegment.from_file(audio_path, format=args.format)
             if args.play:
                 play(audio)
+            stop = time.time()
+            print("playing audio took:", stop - start)
             print(f"Audio has been saved to '{audio_path}'.")
     else:
         print(f"Request failed with status code {response.status_code}")

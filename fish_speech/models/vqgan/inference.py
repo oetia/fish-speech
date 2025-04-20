@@ -11,6 +11,7 @@ from hydra import compose, initialize
 from hydra.utils import instantiate
 from loguru import logger
 from omegaconf import OmegaConf
+import time
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
@@ -103,6 +104,10 @@ def main(input_path, output_path, config_name, checkpoint_path, device):
     else:
         raise ValueError(f"Unknown input type: {input_path}")
 
+    # attempting to decode
+    print("decoding start")
+    start = time.time()
+
     # Restore
     feature_lengths = torch.tensor([indices.shape[1]], device=device)
     fake_audios, _ = model.decode(
@@ -110,9 +115,13 @@ def main(input_path, output_path, config_name, checkpoint_path, device):
     )
     audio_time = fake_audios.shape[-1] / model.spec_transform.sample_rate
 
+    print(f"Indices shape of: {indices.shape}")
     logger.info(
-        f"Generated audio of shape {fake_audios.shape}, equivalent to {audio_time:.2f} seconds from {indices.shape[1]} features, features/second: {indices.shape[1] / audio_time:.2f}"
+        f"Generated audio of shape {fake_audios.shape}, equivalent to {audio_time:.10f} seconds from {indices.shape[1]} features, features/second: {indices.shape[1] / audio_time:.2f}"
     )
+
+    end = time.time()
+    print(f"decoding end: time taken: {end - start}")
 
     # Save audio
     fake_audio = fake_audios[0, 0].float().cpu().numpy()

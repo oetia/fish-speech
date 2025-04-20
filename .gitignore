@@ -12,8 +12,8 @@ filelists
 /checkpoints
 /.vscode
 /data_server/target
-/*.npy
-/*.wav
+# /*.npy
+# /*.wav
 /*.mp3
 /*.lab
 /results
@@ -31,3 +31,4 @@ asr-label*
 /faster_whisper
 /.gradio
 *log
+.python-version
