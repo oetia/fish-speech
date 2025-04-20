@@ -1,3 +1,112 @@
+from pathlib import Path
+
+import click
+import hydra
+import numpy as np
+import pyrootutils
+import soundfile as sf
+import torch
+import torchaudio
+from hydra import compose, initialize
+from hydra.utils import instantiate
+from loguru import logger
+from omegaconf import OmegaConf
+import time
+import math
+from pydub import AudioSegment
+import os
+
+pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+
+from fish_speech.utils.file import AUDIO_EXTENSIONS
+
+# register eval resolver
+OmegaConf.register_new_resolver("eval", eval)
+
+
+def load_model_vqgan(config_name: str, checkpoint_path: str, device="cuda"):
+    hydra.core.global_hydra.GlobalHydra.instance().clear()
+    with initialize(version_base="1.3", config_path="../../configs"):
+        cfg = compose(config_name=config_name)
+
+    model = instantiate(cfg)
+    state_dict = torch.load(
+        checkpoint_path, map_location=device, mmap=True, weights_only=True
+    )
+    if "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+
+    if any("generator" in k for k in state_dict):
+        state_dict = {
+            k.replace("generator.", ""): v
+            for k, v in state_dict.items()
+            if "generator." in k
+        }
+
+    result = model.load_state_dict(state_dict, strict=False, assign=True)
+    model.eval()
+    model.to(device)
+
+    logger.info(f"Loaded model: {result}")
+    return model
+
+
+@torch.no_grad()
+def vqgan_inference(indices: torch.Tensor, endpoint: int, model, device="cuda"):
+
+    print(f"decoding start")
+    start = time.time()
+    feature_lengths = torch.tensor([indices.shape[1]], device=device)
+    fake_audios, _ = model.decode(
+        indices=indices[None], feature_lengths=feature_lengths
+    )
+    audio_time = fake_audios.shape[-1] / model.spec_transform.sample_rate
+    end = time.time()
+    print(f"decoding end: time taken: {end - start}")
+
+    print(f"Indices shape of: {indices.shape}")
+    logger.info(
+        f"Generated audio of shape {fake_audios.shape}, equivalent to {audio_time:.10f} seconds from {indices.shape[1]} features, features/second: {indices.shape[1] / audio_time:.2f}"
+    )
+
+    # Save audio
+    fake_audio = fake_audios[0, 0].float().cpu().numpy()
+    startpoint = math.ceil(endpoint / 10) * 10 - 10
+    print(startpoint, endpoint)
+
+    output_path = f"./temp/cum-{endpoint}.wav"
+    print(f"saving cum to {output_path}")
+    sf.write(output_path, fake_audio, model.spec_transform.sample_rate)
+    logger.info(f"Saved audio to {output_path}")
+
+    output_path = f"./temp/new-{endpoint}.wav"
+    print(f"saving new portion to {output_path}")
+    sf.write(output_path, fake_audio[startpoint*2048:], model.spec_transform.sample_rate)
+    logger.info(f"Saved audio to {output_path}")
+
+
+    # going to check to see if the without context the codebook generation worsens
+    indices = indices[:, startpoint:]
+    print(indices.shape)
+    feature_lengths = torch.tensor([indices.shape[1]], device=device)
+    fake_audios, _ = model.decode(
+        indices=indices[None], feature_lengths=feature_lengths
+    )
+    fake_audio = fake_audios[0, 0].float().cpu().numpy()
+    output_path = f"./temp/ONLYnew-{endpoint}.wav"
+    print(f"saving ONLYnew portion to {output_path}")
+    sf.write(output_path, fake_audio, model.spec_transform.sample_rate)
+    logger.info(f"Saved audio to {output_path}")
+
+
+
+
+
+
+
+
+
+
 import os
 import queue
 import threading
@@ -702,7 +811,7 @@ def encode_tokens(
     return encoded.to(device)
 
 
-def load_model(checkpoint_path, device, precision, compile=False, is_agent=False):
+def load_model_llm(checkpoint_path, device, precision, compile=False, is_agent=False):
     model: Union[NaiveTransformer, DualARTransformer] = BaseTransformer.from_pretrained(
         checkpoint_path, load_weights=True, is_agent=is_agent
     )
@@ -946,7 +1055,7 @@ def launch_thread_safe_queue(
     init_event = threading.Event()
 
     def worker():
-        model, decode_one_token = load_model(
+        model, decode_one_token = load_model_llm(
             checkpoint_path, device, precision, compile=compile
         )
         with torch.device(device):
@@ -994,7 +1103,7 @@ def launch_thread_safe_queue_agent(
     config = BaseModelArgs.from_pretrained(checkpoint_path)
 
     def worker():
-        model, decode_one_token = load_model(
+        model, decode_one_token = load_model_llm(
             checkpoint_path, device, precision, compile=compile, is_agent=True
         )
 
@@ -1084,6 +1193,11 @@ def main(
     output_dir: Path,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
+
+    logger.info("Loading model VQGAN ...")
+    model_vqgan = load_model_vqgan("firefly_gan_vq", os.path.join(checkpoint_path, "firefly-gan-vq-fsq-8x1024-21hz-generator.pth"), device=device)
+
+
     precision = torch.half if half else torch.bfloat16
 
     if prompt_text is not None and len(prompt_text) != len(prompt_tokens):
@@ -1091,16 +1205,16 @@ def main(
             f"Number of prompt text ({len(prompt_text)}) and prompt tokens ({len(prompt_tokens)}) should be the same"
         )
 
-    logger.info("Loading model ...")
+    logger.info("Loading model LLM ...")
     t0 = time.time()
-    model, decode_one_token = load_model(
+    model_llm, decode_one_token = load_model_llm(
         checkpoint_path, device, precision, compile=compile
     )
     with torch.device(device):
-        model.setup_caches(
+        model_llm.setup_caches(
             max_batch_size=1,
-            max_seq_len=model.config.max_seq_len,
-            dtype=next(model.parameters()).dtype,
+            max_seq_len=model_llm.config.max_seq_len,
+            dtype=next(model_llm.parameters()).dtype,
         )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -1117,7 +1231,7 @@ def main(
 
 
     generator = generate_long(
-        model=model,
+        model=model_llm,
         device=device,
         decode_one_token=decode_one_token,
         text=text,
@@ -1154,8 +1268,8 @@ def main(
                     logger.info(f"Saved codes to {codes_npy_path}")
                     print("torch final dim: ", torch.cat(codes, dim=1).shape)
 
-                    tokens_array = np.concatenate(tokens, axis=1)
-                    print("tokens final dim: ", tokens_array.shape)
+                    tokens_array = torch.cat(tokens, dim=1)
+                    print(tokens_array.shape)
                 logger.info(f"Next sample")
                 codes = []
                 idx += 1
@@ -1163,13 +1277,32 @@ def main(
                 logger.error(f"Error: {response}")
         else:
             if response[0] == "next_token":
-                tokens.append(response[1][1:, :].cpu().numpy())
+                tokens.append(response[1][1:, :])
                 if len(tokens) % 10 == 0: # on every tenth token do a generation
-                    tokens_array = np.concatenate(tokens, axis=1)
-                    # print(tokens_array.shape)
-                # print("sanity check")
-    end = time.time()
+                    # tokens_array = np.concatenate(tokens, axis=1)
+                    tokens_array = torch.cat(tokens, dim=1)
+                    print(tokens_array.shape)
 
+                    vqgan_inference(tokens_array, len(tokens), model=model_vqgan)
+
+                    new_wavs = list(map(lambda x: f"./temp/{x}", sorted(list(filter(lambda x: x.startswith("new"), os.listdir("./temp"))), key=lambda x: int(x.split(".")[0].split("-")[1]))))
+                    new_combined = AudioSegment.empty()
+                    for wav in new_wavs:
+                        print(wav)
+                        audio = AudioSegment.from_wav(wav)
+                        new_combined += audio  # Append
+                    new_combined.export("./temp/new-combined.wav", format="wav")
+
+                    ONLYnew_wavs = list(map(lambda x: f"./temp/{x}", sorted(list(filter(lambda x: x.startswith("ONLYnew"), os.listdir("./temp"))), key=lambda x: int(x.split(".")[0].split("-")[1]))))
+                    ONLYnew_combined = AudioSegment.empty()
+                    for wav in ONLYnew_wavs:
+                        print(wav)
+                        audio = AudioSegment.from_wav(wav)
+                        ONLYnew_combined += audio  # Append
+                    ONLYnew_combined.export("./temp/ONLYnew-combined.wav", format="wav")
+
+
+    end = time.time()
     print(f"finished generation: time taken: {end - start}")
 
 
