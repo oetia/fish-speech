@@ -364,6 +364,7 @@ def decode_n_tokens(
     )
 
     for i in tqdm(range(num_new_tokens)):
+        # print("generating token ", i)
         # We need to get windowed repeat penalty
         win_size = 16
         if i < win_size:
@@ -1120,3 +1121,8 @@ def main(
 
 if __name__ == "__main__":
     main()
+
+
+
+# api call
+# 
