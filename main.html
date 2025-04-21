@@ -1,0 +1,454 @@
+
+<!-- 
+damn. 
+https://aistudio.google.com/app/prompts/1joRxh73yX9LSd_8kN4Ck6oujTgOyrjVH 
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TTS Audio Streaming</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 600px;
+        margin: 20px auto;
+        padding: 20px;
+      }
+      .form-group {
+        margin-bottom: 15px;
+      }
+      label {
+        display: block;
+        margin-bottom: 5px;
+      }
+      input,
+      textarea,
+      select {
+        width: 100%;
+        padding: 8px;
+        margin-bottom: 10px;
+        box-sizing: border-box; /* Ensures padding is included in width */
+        border: 1px solid #ccc;
+        border-radius: 4px;
+      }
+      button {
+        padding: 10px 20px;
+        background-color: #007bff;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      button:hover {
+        background-color: #0056b3;
+      }
+      #status {
+        margin-top: 15px;
+        font-style: italic;
+        color: #555;
+      }
+      audio {
+        width: 100%;
+        margin-top: 15px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Text-to-Speech Streaming</h1>
+    <form id="ttsForm">
+      <div class="form-group">
+        <label for="name">Name (used for output directory):</label>
+        <input type="text" id="name" name="name" required />
+      </div>
+      <div class="form-group">
+        <label for="tts_text">TTS Text:</label>
+        <textarea id="tts_text" name="tts_text" rows="4" required></textarea>
+      </div>
+      <div class="form-group">
+        <label for="personality">Personality:</label>
+        <select id="personality" name="personality" required>
+          <option value="ling">Ling</option>
+          <option value="chen">Chen</option>
+          <option value="surtr">Surtr</option>
+          <!-- Add other personalities your server supports -->
+        </select>
+      </div>
+      <button type="submit">Generate and Play Audio</button>
+    </form>
+
+    <div id="status">Ready</div>
+    <audio id="audioPlayer" controls></audio>
+    <!-- Removed autoplay here, rely on MSE -->
+
+    <script>
+      const ttsForm = document.getElementById("ttsForm");
+      const audioPlayer = document.getElementById("audioPlayer");
+      const statusDiv = document.getElementById("status");
+
+      let mediaSource = null;
+      let sourceBuffer = null;
+      let currentObjectUrl = null;
+      let fetchAbortController = null; // Controller specifically for fetch
+      let appendQueue = []; // Queue for chunks waiting to be appended
+      let isAppending = false; // Flag to prevent concurrent appends
+      let streamEnded = false; // Flag to know when fetch is done
+
+      // --- Cleanup Function ---
+      function cleanupPreviousStream() {
+        console.log("Cleaning up previous stream resources...");
+        statusDiv.textContent = "Cleaning up...";
+
+        // 1. Abort ongoing fetch
+        if (fetchAbortController) {
+          fetchAbortController.abort();
+          fetchAbortController = null;
+          console.log("Ongoing fetch aborted.");
+        }
+
+        // Reset flags and queue
+        isAppending = false;
+        appendQueue = [];
+        streamEnded = false;
+
+        // 2. Clean up MediaSource and SourceBuffer if they exist
+        if (sourceBuffer) {
+          // Remove listeners to prevent memory leaks from old buffers
+          sourceBuffer.removeEventListener("updateend", processAppendQueue);
+          sourceBuffer.removeEventListener("error", handleSourceBufferError);
+          try {
+            if (mediaSource && mediaSource.readyState === "open") {
+              // Only abort if it's open and associated with the active media source
+              console.log("Aborting source buffer...");
+              sourceBuffer.abort(); // Abort any pending operations
+            }
+          } catch (e) {
+            console.warn("Error aborting source buffer:", e);
+          }
+          sourceBuffer = null;
+          console.log("SourceBuffer reference cleared.");
+        }
+
+        if (mediaSource) {
+          // Remove listener from old mediaSource
+          mediaSource.removeEventListener("sourceopen", handleSourceOpen);
+          // End of stream if it was open and not already ended
+          try {
+            if (mediaSource.readyState === "open" && !mediaSource.duration) {
+              // Check if endOfStream wasn't called properly
+              console.log("Attempting to end stream on old MediaSource.");
+              mediaSource.endOfStream();
+            }
+          } catch (e) {
+            console.warn("Error ending stream on old MediaSource:", e);
+          }
+          mediaSource = null; // Clear reference
+          console.log("MediaSource reference cleared.");
+        }
+
+        // 3. Reset Audio Player
+        // Setting src to empty string is often better than removeAttribute
+        audioPlayer.pause();
+        audioPlayer.src = ""; // Detach from MediaSource URL
+        audioPlayer.load(); // Reset state
+        console.log("Audio player reset.");
+
+        // 4. Revoke previous Object URL
+        if (currentObjectUrl) {
+          console.log("Revoking previous Object URL:", currentObjectUrl);
+          URL.revokeObjectURL(currentObjectUrl);
+          currentObjectUrl = null;
+        }
+        statusDiv.textContent = "Ready for new request.";
+      }
+
+      // --- SourceBuffer Error Handler ---
+      function handleSourceBufferError(e) {
+        console.error("SourceBuffer error:", e);
+        statusDiv.textContent = "Error during audio buffering.";
+        // Perform cleanup as a severe error occurred
+        cleanupPreviousStream();
+      }
+
+      // --- Append Queue Processor ---
+      function processAppendQueue() {
+        isAppending = false; // Mark append as finished
+        // Check if aborted during the last append operation
+        if (fetchAbortController && fetchAbortController.signal.aborted) {
+          console.log(
+            "Append finished, but request was aborted. Stopping queue."
+          );
+          appendQueue = []; // Clear queue as request is cancelled
+          // Cleanup might be handled by the main abort logic already
+          return;
+        }
+
+        if (appendQueue.length > 0) {
+          const chunk = appendQueue.shift();
+          console.log(
+            `Appending next chunk from queue (${chunk.byteLength} bytes). Queue size: ${appendQueue.length}`
+          );
+          try {
+            isAppending = true;
+            sourceBuffer.appendBuffer(chunk);
+          } catch (e) {
+            console.error("Error appending buffer:", e);
+            statusDiv.textContent = `Error appending buffer: ${e.name}`;
+            // Clear queue and potentially cleanup?
+            appendQueue = [];
+            isAppending = false;
+            // Consider more robust error handling / cleanup here
+            cleanupPreviousStream(); // Cleanup on append error
+          }
+        } else if (streamEnded) {
+          // Queue is empty AND the fetch stream has ended
+          console.log(
+            "Append queue empty and stream ended. Calling endOfStream()."
+          );
+          endMediaSourceStream();
+        } else {
+          // Queue is empty, but stream hasn't ended yet. Waiting for more data.
+          console.log("Append queue empty, waiting for more data...");
+        }
+      }
+
+      // --- Function to safely end the MediaSource stream ---
+      function endMediaSourceStream() {
+        if (
+          mediaSource &&
+          mediaSource.readyState === "open" &&
+          sourceBuffer &&
+          !sourceBuffer.updating
+        ) {
+          try {
+            console.log("Signalling end of stream to MediaSource.");
+            mediaSource.endOfStream();
+          } catch (e) {
+            console.error("Error calling endOfStream:", e);
+            statusDiv.textContent = "Error finalizing stream.";
+          }
+        } else if (sourceBuffer && sourceBuffer.updating) {
+          console.warn(
+            "endMediaSourceStream called while buffer updating. Will retry on next updateend."
+          );
+          // It should be called automatically by processAppendQueue when updating finishes
+        } else {
+          console.warn(
+            "Cannot end stream: MediaSource not open or SourceBuffer not available."
+          );
+        }
+      }
+
+      // --- MediaSource 'sourceopen' Event Handler ---
+      async function handleSourceOpen() {
+        console.log("MediaSource readyState:", mediaSource.readyState);
+        if (mediaSource.readyState !== "open") {
+          console.warn(
+            "Sourceopen called but state is not 'open'. Aborting setup."
+          );
+          return;
+        }
+
+        // Ensure previous buffer is cleaned up if somehow still referenced
+        if (sourceBuffer) {
+          console.warn(
+            "Existing sourceBuffer found during sourceopen. Cleaning up."
+          );
+          sourceBuffer.removeEventListener("updateend", processAppendQueue);
+          sourceBuffer.removeEventListener("error", handleSourceBufferError);
+          try {
+            sourceBuffer.abort();
+          } catch (e) {}
+          sourceBuffer = null;
+        }
+
+        const mimeCodec = "audio/mpeg";
+        if (!MediaSource.isTypeSupported(mimeCodec)) {
+          console.error("MIME type", mimeCodec, "not supported.");
+          statusDiv.textContent =
+            "Error: MP3 audio format not supported by browser.";
+          cleanupPreviousStream();
+          return;
+        }
+
+        try {
+          console.log("Creating SourceBuffer for:", mimeCodec);
+          sourceBuffer = mediaSource.addSourceBuffer(mimeCodec);
+
+          // Add listeners to the *new* sourceBuffer
+          sourceBuffer.addEventListener("updateend", processAppendQueue);
+          sourceBuffer.addEventListener("error", handleSourceBufferError);
+          console.log("SourceBuffer created and listeners added.");
+
+          // Start fetch AFTER sourceBuffer is ready
+          await fetchAndAppendAudio();
+        } catch (e) {
+          console.error("Error creating SourceBuffer:", e);
+          statusDiv.textContent = "Error setting up audio buffer.";
+          cleanupPreviousStream();
+        }
+      }
+
+      // --- Fetch and Append Logic ---
+      async function fetchAndAppendAudio() {
+        // Get form data inside this function, as it runs after submit
+        const formData = new FormData(ttsForm);
+        const requestData = {
+          name: formData.get("name"),
+          tts_text: formData.get("tts_text"),
+          personality: formData.get("personality"),
+        };
+
+        console.log("Starting fetch for TTS stream...");
+        statusDiv.textContent = "Requesting audio stream...";
+
+        try {
+          const response = await fetch("http://localhost:8000/tts/stream", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "audio/mpeg",
+            },
+            body: JSON.stringify(requestData),
+            signal: fetchAbortController.signal, // Use the signal
+          });
+
+          // Check if aborted right after fetch initiated
+          if (fetchAbortController.signal.aborted) {
+            console.log("Fetch aborted immediately after request.");
+            // Cleanup is handled by the main submit handler's abort call
+            return;
+          }
+
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(
+              `Server error: ${response.status} ${response.statusText} - ${errorText}`
+            );
+          }
+          if (!response.body) {
+            throw new Error("Response has no body stream.");
+          }
+
+          statusDiv.textContent = "Receiving audio stream... preparing buffer.";
+          console.log("Received response, getting reader...");
+          const reader = response.body.getReader();
+          let receivedLength = 0;
+
+          // Start playing as soon as the source is open and we expect data
+          // Browser might delay until first chunk is appended and buffered.
+          audioPlayer.play().catch((e) => {
+            console.warn("Autoplay possibly prevented by browser:", e.message);
+            statusDiv.textContent =
+              "Receiving stream... (Click play if needed)";
+          });
+
+          // Read loop
+          while (true) {
+            // Check for abort before reading
+            if (fetchAbortController.signal.aborted) {
+              console.log("Fetch aborted during stream read.");
+              reader.cancel("User aborted fetch");
+              // Cleanup is handled by the main submit handler's abort call
+              return;
+            }
+
+            console.log("Reading next chunk from network...");
+            const { done, value } = await reader.read();
+
+            if (done) {
+              console.log("Network stream finished.");
+              streamEnded = true; // Signal that fetch is complete
+              // If not currently appending, signal end of stream immediately
+              if (!isAppending) {
+                endMediaSourceStream();
+              }
+              // Otherwise, processAppendQueue() will call endMediaSourceStream() when done
+              break; // Exit loop
+            }
+
+            // Got a chunk (value is Uint8Array)
+            receivedLength += value.length;
+            statusDiv.textContent = `Streaming... (${(
+              receivedLength / 1024
+            ).toFixed(1)} KB received)`;
+            appendQueue.push(value); // Add chunk to the queue
+            console.log(
+              `Chunk received (${value.byteLength} bytes), added to queue. Queue size: ${appendQueue.length}`
+            );
+
+            // If not currently appending, start the process
+            if (!isAppending) {
+              processAppendQueue();
+            }
+            // If it *is* appending, the 'updateend' event (handled by processAppendQueue)
+            // will pick up the next chunk from the queue when ready.
+          }
+        } catch (error) {
+          if (error.name === "AbortError") {
+            console.log("Fetch aborted successfully.");
+            statusDiv.textContent = "Stream request cancelled.";
+            // Cleanup is handled by the main submit handler's abort call
+          } else {
+            console.error("Error fetching or processing audio stream:", error);
+            statusDiv.textContent = `Error: ${error.message}`;
+            // Ensure cleanup happens on fetch error too
+            cleanupPreviousStream();
+          }
+        } finally {
+          // No need to reset fetchAbortController here, it's reset in cleanup
+          console.log("fetchAndAppendAudio finished or errored.");
+        }
+      }
+
+      // --- Form Submit Handler ---
+      ttsForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        console.log("--- New Request ---");
+
+        // 1. Cleanup any previous/ongoing stream first
+        cleanupPreviousStream();
+
+        // 2. Create new AbortController for the fetch
+        fetchAbortController = new AbortController();
+
+        // 3. Create and configure new MediaSource
+        try {
+          mediaSource = new MediaSource();
+          console.log("New MediaSource created.");
+
+          // Add the 'sourceopen' listener *before* setting src
+          mediaSource.addEventListener("sourceopen", handleSourceOpen, {
+            once: true,
+          }); // Use once: true for safety? Re-eval if needed
+          console.log("'sourceopen' listener added.");
+
+          // 4. Create Object URL for MediaSource and set as audio src
+          currentObjectUrl = URL.createObjectURL(mediaSource);
+          console.log("Created new Object URL:", currentObjectUrl);
+          audioPlayer.src = currentObjectUrl;
+          audioPlayer.load(); // Important to load the new source
+
+          statusDiv.textContent = "Initializing audio stream...";
+
+          // 5. The actual fetching and appending will start in handleSourceOpen
+          //    triggered when audioPlayer attaches to the MediaSource URL
+        } catch (error) {
+          console.error("Error setting up MediaSource or Audio:", error);
+          statusDiv.textContent = "Failed to initialize audio player.";
+          cleanupPreviousStream(); // Clean up partial setup
+          if (fetchAbortController) fetchAbortController.abort(); // Abort controller if created
+          fetchAbortController = null;
+        }
+      });
+
+      // --- Optional: Cleanup on page unload ---
+      window.addEventListener("unload", () => {
+        console.log("Page unloading, performing final cleanup.");
+        cleanupPreviousStream();
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TTS Audio Streaming</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 600px;
+        margin: 20px auto;
+        padding: 20px;
+      }
+      .form-group {
+        margin-bottom: 15px;
+      }
+      label {
+        display: block;
+        margin-bottom: 5px;
+      }
+      input,
+      textarea,
+      select {
+        width: 100%;
+        padding: 8px;
+        margin-bottom: 10px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+      }
+      button {
+        padding: 10px 20px;
+        background-color: #007bff;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      button:hover {
+        background-color: #0056b3;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Text-to-Speech Streaming</h1>
+    <form id="ttsForm">
+      <div class="form-group">
+        <label for="name">Name:</label>
+        <input type="text" id="name" name="name" required />
+      </div>
+      <div class="form-group">
+        <label for="tts_text">TTS Text:</label>
+        <textarea id="tts_text" name="tts_text" rows="4" required></textarea>
+      </div>
+      <div class="form-group">
+        <label for="personality">Personality:</label>
+        <select id="personality" name="personality" required>
+          <option value="ling">Ling</option>
+          <option value="chen">Chen</option>
+          <option value="surtr">Surtr</option>
+        </select>
+      </div>
+      <button type="submit">Generate and Play Audio</button>
+    </form>
+    <audio id="audioPlayer" controls autoplay></audio>
+
+    <script>
+      // Track the current MediaSource to clean up previous streams
+      let currentMediaSource = null;
+
+      async function playStreamedAudio(formData) {
+        // Clean up previous MediaSource if it exists
+        if (currentMediaSource && currentMediaSource.readyState !== "closed") {
+          currentMediaSource.endOfStream();
+        }
+
+        const audioPlayer = document.getElementById("audioPlayer");
+        const mediaSource = new MediaSource();
+        currentMediaSource = mediaSource;
+
+        // Set the audio element's source to the new MediaSource
+        audioPlayer.src = URL.createObjectURL(mediaSource);
+
+        mediaSource.addEventListener("sourceopen", async () => {
+          // Use audio/mpeg for MP3 (adjust if using another format)
+          let sourceBuffer;
+          try {
+            sourceBuffer = mediaSource.addSourceBuffer("audio/mpeg");
+          } catch (error) {
+            console.error("Failed to add SourceBuffer:", error);
+            return;
+          }
+
+          // Send POST request with JSON body
+          const response = await fetch("http://10.0.1.14:8000/tts/stream", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(formData),
+          });
+
+          if (!response.ok) {
+            console.error("Failed to fetch audio stream:", response.statusText);
+            return;
+          }
+
+          const reader = response.body.getReader();
+
+          async function processStream() {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) {
+                if (mediaSource.readyState === "open") {
+                  mediaSource.endOfStream();
+                }
+                break;
+              }
+
+              try {
+                if (!sourceBuffer.updating) {
+                  sourceBuffer.appendBuffer(value);
+                } else {
+                  await new Promise((resolve) => {
+                    sourceBuffer.addEventListener("updateend", resolve, {
+                      once: true,
+                    });
+                  });
+                  sourceBuffer.appendBuffer(value);
+                }
+              } catch (error) {
+                console.error("Error appending buffer:", error);
+                break;
+              }
+            }
+          }
+
+          sourceBuffer.addEventListener("error", () => {
+            console.error("SourceBuffer error");
+            mediaSource.endOfStream("decode");
+          });
+
+          processStream();
+        });
+
+        mediaSource.addEventListener("error", () => {
+          console.error("MediaSource error");
+        });
+
+        // Play the audio when enough data is buffered
+        audioPlayer.addEventListener(
+          "canplay",
+          () => {
+            audioPlayer.play().catch((error) => {
+              console.error("Playback failed:", error);
+            });
+          },
+          { once: true }
+        );
+      }
+
+      // Handle form submission
+      document
+        .getElementById("ttsForm")
+        .addEventListener("submit", async (event) => {
+          event.preventDefault();
+
+          const formData = {
+            name: document.getElementById("name").value,
+            tts_text: document.getElementById("tts_text").value,
+            personality: document.getElementById("personality").value,
+          };
+
+          document.getElementById("audioPlayer").src = ""
+
+          // Start streaming and playing audio
+          await playStreamedAudio(formData);
+        });
+    </script>
+  </body>
+</html>

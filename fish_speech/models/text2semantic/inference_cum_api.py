@@ -54,7 +54,8 @@ import time
 import math
 from pydub import AudioSegment
 import os
-
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from fish_speech.utils.file import AUDIO_EXTENSIONS
@@ -1303,8 +1304,22 @@ def main(
                     print(tokens_array.shape)
                     cumnew_audio = inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
                     last_stream_end = len(tokens)
+                    # buffer = BytesIO()
+                    # sf.write(buffer, cumnew_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
+                    # buffer.seek(0)
+                    # yield buffer.read()
+
+                    logger.info("cumnew audio shape, min, max: ", cumnew_audio.shape, cumnew_audio.min(), cumnew_audio.max())
+                    audio_int16 = (cumnew_audio * 32767).astype(np.int16)  # Convert to 16-bit PCM
+                    audio_segment = AudioSegment(
+                        audio_int16.tobytes(),
+                        frame_rate=model_vqgan.spec_transform.sample_rate,
+                        sample_width=2,  # 16-bit = 2 bytes
+                        channels=1  # Assuming mono; use 2 for stereo
+                    )
+                    # Export as MP3 to a buffer
                     buffer = BytesIO()
-                    sf.write(buffer, cumnew_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
+                    audio_segment.export(buffer, format="mp3")
                     buffer.seek(0)
                     yield buffer.read()
 
@@ -1316,13 +1331,30 @@ def main(
         else:
             if response[0] == "next_token":
                 tokens.append(response[1][1:, :])
-                if len(tokens) % 50 == 0: # streaming rate
+                # if len(tokens) % 50 == 0: # streaming rate
+                if len(tokens) % 100 == 0: # streaming rate
                     tokens_array = torch.cat(tokens, dim=1)
                     print(tokens_array.shape)
                     cumnew_audio = inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
                     last_stream_end = len(tokens)
+                    # wav unsupported by mediasource in browser
+                    # buffer = BytesIO()
+                    # sf.write(buffer, cumnew_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
+                    # buffer.seek(0)
+                    # yield buffer.read()
+
+                    # Convert numpy array to AudioSegment
+                    # Assuming cumnew_audio is a 1D numpy array of floats in [-1, 1]
+                    audio_int16 = (cumnew_audio * 32767).astype(np.int16)  # Convert to 16-bit PCM
+                    audio_segment = AudioSegment(
+                        audio_int16.tobytes(),
+                        frame_rate=model_vqgan.spec_transform.sample_rate,
+                        sample_width=2,  # 16-bit = 2 bytes
+                        channels=1  # Assuming mono; use 2 for stereo
+                    )
+                    # Export as MP3 to a buffer
                     buffer = BytesIO()
-                    sf.write(buffer, cumnew_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
+                    audio_segment.export(buffer, format="mp3")
                     buffer.seek(0)
                     yield buffer.read()
 
@@ -1332,7 +1364,52 @@ def main(
     print(f"finished generation: time taken: {end - start}")
 
 
+# if __name__ == "__main__":
+#     prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
+#     prompt_tokens = ["surtr.npy"]
+
+#     generator = main("他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。", prompt_text, prompt_tokens, output_dir="./output/surtr/2/")
+#     for buffer in generator:
+#         print(len(buffer))
+
+#     generator = main("私がここに留まってるのは必要だからじゃない、そうしたいからだ。", prompt_text, prompt_tokens, output_dir="./output/surtr/3/")
+#     for buffer in generator:
+#         print(len(buffer))
+
+#     generator = main("何でもすぐどうしてって聞く奴が一番ムカつく。あんたがそうじゃないことを願うよ。", prompt_text, prompt_tokens, output_dir="./output/surtr/4/")
+#     for buffer in generator:
+#         print(len(buffer))
+
+
+
+class FishRequest(BaseModel):
+    name: str = Field(
+        ...,
+        max_length=50,
+        pattern=r'^[a-zA-Z0-9]+$'
+    )
+    tts_text: str
+    personality: Literal["ling", "chen", "surtr"] = "ling"
+@app.post("/tts/stream")
+async def tts_stream(request: FishRequest):
+    text = "他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。"
+    prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
+    prompt_tokens = ["surtr.npy"]
+
+    output_dir = os.path.join(args.output_base_dir, request.name)
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"output dir {output_dir}")
+
+    try:
+        return StreamingResponse(
+            main(request.tts_text, prompt_text, prompt_tokens, output_dir),
+            media_type="audio/mpeg"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
 if __name__ == "__main__":
+
     prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
     prompt_tokens = ["surtr.npy"]
 
@@ -1348,34 +1425,6 @@ if __name__ == "__main__":
     for buffer in generator:
         print(len(buffer))
 
-
-
-# class FishRequest(BaseModel):
-#     name: str = Field(
-#         ...,
-#         max_length=50,
-#         pattern=r'^[a-zA-Z0-9]+$'
-#     )
-#     tts_text: str
-#     personality: Literal["ling", "chen", "surtr"] = "ling"
-# @app.post("/tts/stream")
-# async def tts_stream(request: FishRequest):
-#     text = "他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。"
-#     prompt_text = "あんた、自分の仕事も全うできないからって、私に助けろっていうの？"
-#     prompt_tokens = "surtr.npy"
-
-#     output_dir = os.path.join(args.output_base_path, request.name)
-#     os.makedirs(output_dir)
-
-#     try:
-#         return StreamingResponse(
-#             main(text, prompt_text, prompt_tokens, output_dir),
-#             media_type="audio/wav"
-#         )
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-    
-# if __name__ == "__main__":
-#     import uvicorn
-#     print("Starting server... Imports loaded.")
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
+    import uvicorn
+    print("Starting server... Imports loaded.")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
