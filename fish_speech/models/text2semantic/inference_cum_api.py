@@ -15,6 +15,26 @@ print("sanity check")
 
 
 
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.exceptions import HTTPException
+from typing import Literal
+from pydantic import BaseModel, Field
+from io import BytesIO
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    # allow_origins=["http://127.0.0.1:7997"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+
+
 
 
 from pathlib import Path
@@ -1225,7 +1245,7 @@ def main(
     half: bool = args.half,
     iterative_prompt: bool = True,
     chunk_length: int = 100,
-) -> None:
+):
     os.makedirs(output_dir, exist_ok=True)
 
     if prompt_text is not None and len(prompt_text) != len(prompt_tokens):
@@ -1281,8 +1301,12 @@ def main(
 
                     tokens_array = torch.cat(tokens, dim=1)
                     print(tokens_array.shape)
-                    inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
+                    cumnew_audio = inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
                     last_stream_end = len(tokens)
+                    buffer = BytesIO()
+                    sf.write(buffer, cumnew_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
+                    buffer.seek(0)
+                    yield buffer.read()
 
                 logger.info(f"Next sample")
                 codes = []
@@ -1295,9 +1319,12 @@ def main(
                 if len(tokens) % 50 == 0: # streaming rate
                     tokens_array = torch.cat(tokens, dim=1)
                     print(tokens_array.shape)
-                    # vqgan_inference(tokens_array, len(tokens), model=model_vqgan)
-                    inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
+                    cumnew_audio = inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
                     last_stream_end = len(tokens)
+                    buffer = BytesIO()
+                    sf.write(buffer, cumnew_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
+                    buffer.seek(0)
+                    yield buffer.read()
 
     combine_outputs(output_dir)
 
@@ -1309,6 +1336,46 @@ if __name__ == "__main__":
     prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
     prompt_tokens = ["surtr.npy"]
 
-    main("他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。", prompt_text, prompt_tokens, output_dir="./output/surtr/2/")
-    main("私がここに留まってるのは必要だからじゃない、そうしたいからだ。", prompt_text, prompt_tokens, output_dir="./output/surtr/3/")
-    main("何でもすぐどうしてって聞く奴が一番ムカつく。あんたがそうじゃないことを願うよ。", prompt_text, prompt_tokens, output_dir="./output/surtr/4/")
+    generator = main("他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。", prompt_text, prompt_tokens, output_dir="./output/surtr/2/")
+    for buffer in generator:
+        print(len(buffer))
+
+    generator = main("私がここに留まってるのは必要だからじゃない、そうしたいからだ。", prompt_text, prompt_tokens, output_dir="./output/surtr/3/")
+    for buffer in generator:
+        print(len(buffer))
+
+    generator = main("何でもすぐどうしてって聞く奴が一番ムカつく。あんたがそうじゃないことを願うよ。", prompt_text, prompt_tokens, output_dir="./output/surtr/4/")
+    for buffer in generator:
+        print(len(buffer))
+
+
+
+# class FishRequest(BaseModel):
+#     name: str = Field(
+#         ...,
+#         max_length=50,
+#         pattern=r'^[a-zA-Z0-9]+$'
+#     )
+#     tts_text: str
+#     personality: Literal["ling", "chen", "surtr"] = "ling"
+# @app.post("/tts/stream")
+# async def tts_stream(request: FishRequest):
+#     text = "他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。"
+#     prompt_text = "あんた、自分の仕事も全うできないからって、私に助けろっていうの？"
+#     prompt_tokens = "surtr.npy"
+
+#     output_dir = os.path.join(args.output_base_path, request.name)
+#     os.makedirs(output_dir)
+
+#     try:
+#         return StreamingResponse(
+#             main(text, prompt_text, prompt_tokens, output_dir),
+#             media_type="audio/wav"
+#         )
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+    
+# if __name__ == "__main__":
+#     import uvicorn
+#     print("Starting server... Imports loaded.")
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
