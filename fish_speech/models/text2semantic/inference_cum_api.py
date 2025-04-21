@@ -5,7 +5,7 @@ parser.add_argument("--device", type=str, default="cuda")
 parser.add_argument("--compile", dest="compile", action="store_true")
 parser.add_argument("--no-compile", dest="compile", action="store_false")
 parser.add_argument("--half", dest="compile", action="store_true")
-parser.add_argument("--output-base-path", type=str, default="./output")
+parser.add_argument("--output-base-dir", type=str, default="./output")
 parser.set_defaults(half=False)
 args = parser.parse_args()
 print(args)
@@ -1191,6 +1191,23 @@ def launch_thread_safe_queue_agent(
     return input_queue, tokenizer, config
 
 
+logger.info("Loading model LLM ...")
+t0 = time.time()
+precision = torch.half if args.half else torch.bfloat16
+model_llm, decode_one_token = load_model_llm(
+    args.checkpoint_path, args.device, precision, compile=args.compile
+)
+with torch.device(args.device):
+    model_llm.setup_caches(
+        max_batch_size=1,
+        max_seq_len=model_llm.config.max_seq_len,
+        dtype=next(model_llm.parameters()).dtype,
+    )
+if torch.cuda.is_available():
+    torch.cuda.synchronize()
+logger.info(f"Time to load model: {time.time() - t0:.02f} seconds")
+
+
 def main(
     text: str,
     prompt_text: Optional[list[str]], # TODO: replace with prompt_dir in the future
@@ -1211,32 +1228,10 @@ def main(
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
 
-    logger.info("Loading model VQGAN ...")
-    model_vqgan = load_model_vqgan("firefly_gan_vq", os.path.join(checkpoint_path, "firefly-gan-vq-fsq-8x1024-21hz-generator.pth"), device=device)
-
-
-    precision = torch.half if half else torch.bfloat16
-
     if prompt_text is not None and len(prompt_text) != len(prompt_tokens):
         raise ValueError(
             f"Number of prompt text ({len(prompt_text)}) and prompt tokens ({len(prompt_tokens)}) should be the same"
         )
-
-    logger.info("Loading model LLM ...")
-    t0 = time.time()
-    model_llm, decode_one_token = load_model_llm(
-        checkpoint_path, device, precision, compile=compile
-    )
-    with torch.device(device):
-        model_llm.setup_caches(
-            max_batch_size=1,
-            max_seq_len=model_llm.config.max_seq_len,
-            dtype=next(model_llm.parameters()).dtype,
-        )
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-    logger.info(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     if prompt_tokens is not None:
         prompt_tokens = [torch.from_numpy(np.load(p)).to(device) for p in prompt_tokens]
@@ -1245,7 +1240,6 @@ def main(
 
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
-
 
     generator = generate_long(
         model=model_llm,
@@ -1287,6 +1281,9 @@ def main(
 
                     tokens_array = torch.cat(tokens, dim=1)
                     print(tokens_array.shape)
+                    inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
+                    last_stream_end = len(tokens)
+
                 logger.info(f"Next sample")
                 codes = []
                 idx += 1
@@ -1295,24 +1292,23 @@ def main(
         else:
             if response[0] == "next_token":
                 tokens.append(response[1][1:, :])
-                if len(tokens) % 10 == 0: # on every tenth token do a generation
-                    # tokens_array = np.concatenate(tokens, axis=1)
+                if len(tokens) % 50 == 0: # streaming rate
                     tokens_array = torch.cat(tokens, dim=1)
                     print(tokens_array.shape)
-
                     # vqgan_inference(tokens_array, len(tokens), model=model_vqgan)
-                    inference_save_get_stream(tokens_array, last_stream_end, len(tokens), "./output/temp")
+                    inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
                     last_stream_end = len(tokens)
 
-    combine_outputs("./output/temp")
+    combine_outputs(output_dir)
 
     end = time.time()
     print(f"finished generation: time taken: {end - start}")
 
 
 if __name__ == "__main__":
-    text = "他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。"
     prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
     prompt_tokens = ["surtr.npy"]
 
-    main(text, prompt_text, prompt_tokens, output_dir="./output/temp")
+    main("他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。", prompt_text, prompt_tokens, output_dir="./output/surtr/2/")
+    main("私がここに留まってるのは必要だからじゃない、そうしたいからだ。", prompt_text, prompt_tokens, output_dir="./output/surtr/3/")
+    main("何でもすぐどうしてって聞く奴が一番ムカつく。あんたがそうじゃないことを願うよ。", prompt_text, prompt_tokens, output_dir="./output/surtr/4/")
