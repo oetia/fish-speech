@@ -1,3 +1,35 @@
+import argparse
+parser = argparse.ArgumentParser(description="Run something mediocre.")
+parser.add_argument("--checkpoint-path", type=str)
+parser.add_argument("--device", type=str, default="cuda")
+args = parser.parse_args()
+print(args)
+
+
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.exceptions import HTTPException
+from typing import Literal
+from pydantic import BaseModel
+from io import BytesIO
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    # allow_origins=["http://127.0.0.1:7997"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+
+
+
+
+
 from pathlib import Path
 
 import click
@@ -50,54 +82,55 @@ def load_model_vqgan(config_name: str, checkpoint_path: str, device="cuda"):
     logger.info(f"Loaded model: {result}")
     return model
 
+model_vqgan = load_model_vqgan(
+    "firefly_gan_vq", 
+    os.path.join(args.checkpoint_path, "firefly-gan-vq-fsq-8x1024-21hz-generator.pth"), 
+    device=args.device
+)
 
 @torch.no_grad()
-def vqgan_inference(indices: torch.Tensor, endpoint: int, model, device="cuda"):
-
-    print(f"decoding start")
+def vqgan_inference(
+    indices: torch.Tensor, # grouped finite scalar vector quantization encoded (8,n)
+):
+    logger.info(f"Decoding start")
     start = time.time()
-    feature_lengths = torch.tensor([indices.shape[1]], device=device)
-    fake_audios, _ = model.decode(
+    feature_lengths = torch.tensor([indices.shape[1]], device=args.device)
+    fake_audios, _ = model_vqgan.decode(
         indices=indices[None], feature_lengths=feature_lengths
     )
-    audio_time = fake_audios.shape[-1] / model.spec_transform.sample_rate
+    audio_time = fake_audios.shape[-1] / model_vqgan.spec_transform.sample_rate
     end = time.time()
-    print(f"decoding end: time taken: {end - start}")
-
-    print(f"Indices shape of: {indices.shape}")
+    logger.info(f"Decoding end: time taken: {end - start:3f} seconds")
     logger.info(
         f"Generated audio of shape {fake_audios.shape}, equivalent to {audio_time:.10f} seconds from {indices.shape[1]} features, features/second: {indices.shape[1] / audio_time:.2f}"
     )
-
-    # Save audio
     fake_audio = fake_audios[0, 0].float().cpu().numpy()
-    startpoint = math.ceil(endpoint / 10) * 10 - 10
-    print(startpoint, endpoint)
-
-    output_path = f"./temp/cum-{endpoint}.wav"
-    print(f"saving cum to {output_path}")
-    sf.write(output_path, fake_audio, model.spec_transform.sample_rate)
-    logger.info(f"Saved audio to {output_path}")
-
-    output_path = f"./temp/new-{endpoint}.wav"
-    print(f"saving new portion to {output_path}")
-    sf.write(output_path, fake_audio[startpoint*2048:], model.spec_transform.sample_rate)
-    logger.info(f"Saved audio to {output_path}")
+    return fake_audio
 
 
-    # going to check to see if the without context the codebook generation worsens
-    indices = indices[:, startpoint:]
-    print(indices.shape)
-    feature_lengths = torch.tensor([indices.shape[1]], device=device)
-    fake_audios, _ = model.decode(
-        indices=indices[None], feature_lengths=feature_lengths
-    )
-    fake_audio = fake_audios[0, 0].float().cpu().numpy()
-    output_path = f"./temp/ONLYnew-{endpoint}.wav"
-    print(f"saving ONLYnew portion to {output_path}")
-    sf.write(output_path, fake_audio, model.spec_transform.sample_rate)
-    logger.info(f"Saved audio to {output_path}")
+def inference_save_get_stream(
+    indices: torch.Tensor,
+    splice_start: int, # inclusive
+    splice_end: int, # exclusive
+    output_dir: str,
+    upsample_factor: int = 2048,
+):
+    cum_audio = vqgan_inference(indices)
+    cum_output_path = os.path.join(output_dir, f"cum-{splice_start}-{splice_end}.wav")
+    sf.write(cum_output_path, cum_audio, model_vqgan.spec_transform.sample_rate)
+    logger.info(f"Saved CUM audio to {cum_output_path}")
 
+    cumnew_audio = cum_audio[splice_start*upsample_factor:splice_end*upsample_factor]
+    cumnew_output_path = os.path.join(output_dir, f"cumnew-{splice_start}-{splice_end}.wav")
+    sf.write(cumnew_output_path, cumnew_audio, model_vqgan.spec_transform.sample_rate)
+    logger.info(f"Saved CUMNEW audio to {cumnew_output_path}")
+
+    onlynew_audio = vqgan_inference(indices[splice_start:splice_end])
+    onlynew_output_path = os.path.join(output_dir, f"onlynew-{splice_start}-{splice_end}.wav")
+    sf.write(onlynew_output_path, onlynew_audio, model_vqgan.spec_transform.sample_rate)
+    logger.info(f"Saved ONLYNEW audio to {onlynew_audio}")
+
+    return cumnew_audio
 
 
 
@@ -1144,58 +1177,27 @@ def launch_thread_safe_queue_agent(
     return input_queue, tokenizer, config
 
 
-@click.command()
-@click.option(
-    "--text",
-    type=str,
-    default="你说的对, 但是原神是一款由米哈游自主研发的开放世界手游.",
-)
-@click.option("--prompt-text", type=str, default=None, multiple=True)
-@click.option(
-    "--prompt-tokens",
-    type=click.Path(path_type=Path, exists=True),
-    default=None,
-    multiple=True,
-)
-@click.option("--num-samples", type=int, default=1)
-@click.option("--max-new-tokens", type=int, default=0)
-@click.option("--top-p", type=float, default=0.7)
-@click.option("--repetition-penalty", type=float, default=1.2)
-@click.option("--temperature", type=float, default=0.7)
-@click.option(
-    "--checkpoint-path",
-    type=click.Path(path_type=Path, exists=True),
-    default="checkpoints/fish-speech-1.5",
-)
-@click.option("--device", type=str, default="cuda")
-@click.option("--compile/--no-compile", default=False)
-@click.option("--seed", type=int, default=42)
-@click.option("--half/--no-half", default=False)
-@click.option("--iterative-prompt/--no-iterative-prompt", default=True)
-@click.option("--chunk-length", type=int, default=100)
-@click.option("--output-dir", type=Path, default="temp")
-def main(
+def generate_audio_chunks(
     text: str,
     prompt_text: Optional[list[str]],
     prompt_tokens: Optional[list[Path]],
-    num_samples: int,
-    max_new_tokens: int,
-    top_p: int,
-    repetition_penalty: float,
-    temperature: float,
-    checkpoint_path: Path,
-    device: str,
-    compile: bool,
-    seed: int,
-    half: bool,
-    iterative_prompt: bool,
-    chunk_length: int,
-    output_dir: Path,
-) -> None:
+    num_samples: int = 1,
+    max_new_tokens: int = 0,
+    top_p: float = 0.7,
+    repetition_penalty: float = 1.2,
+    temperature: float = 0.7,
+    checkpoint_path = "/media/sam/pain/models/fishaudio/fish-speech-1.5/",
+    device: str = "cuda",
+    compile: bool = False, # set to True later
+    seed: int = 16,
+    half: bool = False,
+    iterative_prompt: bool = True,
+    chunk_length: int = 100,
+    output_dir = "./temp",
+):
     os.makedirs(output_dir, exist_ok=True)
 
     logger.info("Loading model VQGAN ...")
-    model_vqgan = load_model_vqgan("firefly_gan_vq", os.path.join(checkpoint_path, "firefly-gan-vq-fsq-8x1024-21hz-generator.pth"), device=device)
 
 
     precision = torch.half if half else torch.bfloat16
@@ -1283,7 +1285,11 @@ def main(
                     tokens_array = torch.cat(tokens, dim=1)
                     print(tokens_array.shape)
 
-                    vqgan_inference(tokens_array, len(tokens), model=model_vqgan)
+                    new_audio = vqgan_inference(tokens_array, len(tokens), model=model_vqgan)
+                    buffer = BytesIO()
+                    sf.write(buffer, new_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
+                    buffer.seek(0)
+                    yield buffer.read()
 
     # combining to check quality of outputs
     new_wavs = list(map(lambda x: f"./temp/{x}", sorted(list(filter(lambda x: x.startswith("new"), os.listdir("./temp"))), key=lambda x: int(x.split(".")[0].split("-")[1]))))
@@ -1307,6 +1313,79 @@ def main(
     print(f"finished generation: time taken: {end - start}")
 
 
-if __name__ == "__main__":
-    main()
+class FishRequest(BaseModel):
+    name: str
+    text: str
+    personality: Literal["ling", "chen", "surtr"] = "ling"
+@app.post("/tts/stream")
+async def tts_stream(request: FishRequest):
+    text = "他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。"
+    prompt_text = "あんた、自分の仕事も全うできないからって、私に助けろっていうの？"
+    prompt_tokens = "surtr.npy"
 
+    # prompt_text = None
+    # prompt_tokens = None
+    # if request.personality == "ling":
+    #     prompt_tokens = [
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_001.mp3'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_002.mp3'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_003.mp3'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_004.mp3'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_005.mp3'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_006.mp3'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_007.mp3'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_008.mp3'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_009.mp3'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_010.mp3')
+    #     ]
+    #     prompt_text = [
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_001.txt'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_002.txt'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_003.txt'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_004.txt'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_005.txt'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_006.txt'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_007.txt'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_008.txt'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_009.txt'),
+    #         os.path.join(base_dir, 'voice/ling/aceship/CN_010.txt')
+    #     ]
+    # elif request.personality == "chen":
+    #     prompt_tokens = [
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_001.mp3'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_002.mp3'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_003.mp3'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_004.mp3'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_005.mp3'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_006.mp3'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_007.mp3'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_008.mp3'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_009.mp3'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_010.mp3')
+    #     ]
+    #     prompt_text = [
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_001.txt'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_002.txt'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_003.txt'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_004.txt'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_005.txt'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_006.txt'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_007.txt'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_008.txt'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_009.txt'),
+    #         os.path.join(base_dir, 'voice/chen/aceship/CN_010.txt')
+    #     ]
+
+    try:
+        return StreamingResponse(
+            generate_audio_chunks(text, prompt_text, prompt_tokens),
+            media_type="audio/wav"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# if __name__ == "__main__":
+#     import uvicorn
+#     print("Starting server... Imports loaded.")
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
