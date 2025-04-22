@@ -1330,8 +1330,8 @@ def main(
         else:
             if response[0] == "next_token":
                 tokens.append(response[1][1:, :])
-                # if len(tokens) % 50 == 0: # streaming rate
-                if len(tokens) % 100 == 0: # streaming rate
+                if len(tokens) % 50 == 0: # streaming rate
+                # if len(tokens) % 100 == 0: # streaming rate
                     tokens_array = torch.cat(tokens, dim=1)
                     print(tokens_array.shape)
                     cumnew_audio = inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
@@ -1394,10 +1394,63 @@ async def tts_stream(request: FishRequest):
 
     prompt_text = ["昨夜我梦见了你，不！兴许是你梦见了我。唔，记不得了？可惜，那般得意，却不能与人同享。得意什么？呵，八千年为春，八千年为冬，梦见的那些，也不过短短几个秋，如此罢了。"]
     prompt_tokens = ["ling.npy"]
+    # prompt_text = ["昨夜我梦见了你，不！兴许是你梦见了我。唔，记不得了？可惜，那般得意，却不能与人同享。得意什么？呵，八千年为春，八千年为冬，梦见的那些，也不过短短几个秋，如此罢了。"]
+    # prompt_tokens = ["ling.npy"]
 
     # text = "他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。"
     # prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
     # prompt_tokens = ["surtr.npy"]
+
+    if request.personality == "ling":
+        prompt_text = [
+            "真让人怀念，很多年前，我也曾如今天这般走入那谋臣似雨的阁楼。",
+            "没错，大炎学士口中的“岁”，既是“我们”，也是“祂”。这倒没什么好藏掖的，我也不担心年所担心的。毕竟我只是我，死了也只是死了，只可惜了这杯中物和这天地，我终究是喜欢的。",
+            "本以为总算能遇见一位故人，说不定，还是故知，不曾想，你却是如今这般模样。不知我是我，与大梦何异？不过博士，就当你自己也无妨，我与我周旋久，宁做我。",
+            "在心为志，发言为诗，若满腔胸臆，气象万千，不写出来岂不是愧对自己？嗯？尾巴？呵呵，笔自然也是用的，但毕竟是外物，不方便嘛，我身既是逍遥身，谁说用尾巴就不行？",
+            "诗词歌赋，虽然各不相同，却又有相通之处。可惜如今的人呐，大都耐不下性子，听一首曲，读一首诗，我倒是不以为然，就是苦了些当今文人。",
+            "年太急躁，夕又胆小，可看她俩如今的模样，又好像已经知道自己喜欢什么，想做什么。那又何必纠结于什么真真假假，你你我我呢？每天吵架拌嘴，喜怒哀乐，不就是人心吗。",
+            "博士，想不想让我为你题首诗？嗯？没有，只是来了兴致。不用写，也不用记下来。等等，若是谱曲倒也不差！不过要舞一曲，恐怕要做些准备，好！你先坐着，等我片刻。",
+            "醉了？呵......尚未见天开月明，海走冰散，真等到世人皆醒，也不过枯枝一新芽，真要大醉一场，还为时尚早......博士呀，你怎么能说我醉了呢？",
+            "昨夜我梦见了你，不！兴许是你梦见了我。唔，记不得了？可惜，那般得意，却不能与人同享。得意什么？呵，八千年为春，八千年为冬，梦见的那些，也不过短短几个秋，如此罢了。",
+            "云峦波涛，千里枯路，江山故人我，晚秋行舟。",
+        ]
+        prompt_tokens = [
+            "./voice/ling/aceship/CN_001.npy",
+            "./voice/ling/aceship/CN_002.npy",
+            "./voice/ling/aceship/CN_003.npy",
+            "./voice/ling/aceship/CN_004.npy",
+            "./voice/ling/aceship/CN_005.npy",
+            "./voice/ling/aceship/CN_006.npy",
+            "./voice/ling/aceship/CN_007.npy",
+            "./voice/ling/aceship/CN_008.npy",
+            "./voice/ling/aceship/CN_009.npy",
+            "./voice/ling/aceship/CN_010.npy",
+        ]
+    elif request.personality == "chen":
+        prompt_text = [
+            "博士，现在起由我担任你的护卫。",
+            "我一直觉得你们罗德岛很可疑，现在也一样。",
+            "你怎么还在盯着我看？你的工作呢？",
+            "哼。",
+            "龙门的大街小巷我都走过。码头、招牌、坡道，那些风景印在我的心上。我永远都不会忘记。",
+            "周边地区的局势并不稳定，虽然我会时刻保持警戒，但你也不能疏忽大意。",
+            "也许有一天我会得到那个人的认可，在那之前......",
+            "阿米娅深深信赖着你。看着你们两人站在一起，我偶尔也会觉得，如果我身边，也能有这样一个人......",
+            "我......我从没试过去毫无保留地相信一个人，即使是那个人也......",
+            "博士？睡着了？哼，真没紧张感。",
+        ]
+        prompt_tokens = [
+            "./voice/chen/aceship/CN_001.npy",
+            "./voice/chen/aceship/CN_002.npy",
+            "./voice/chen/aceship/CN_003.npy",
+            "./voice/chen/aceship/CN_004.npy",
+            "./voice/chen/aceship/CN_005.npy",
+            "./voice/chen/aceship/CN_006.npy",
+            "./voice/chen/aceship/CN_007.npy",
+            "./voice/chen/aceship/CN_008.npy",
+            "./voice/chen/aceship/CN_009.npy",
+            "./voice/chen/aceship/CN_010.npy",
+        ]
 
     output_dir = os.path.join(args.output_base_dir, request.name)
     os.makedirs(output_dir, exist_ok=True)
@@ -1413,23 +1466,20 @@ async def tts_stream(request: FishRequest):
     
 if __name__ == "__main__":
     
-    prompt_text=["昨夜我梦见了你，不！兴许是你梦见了我。唔，记不得了？可惜，那般得意，却不能与人同享。得意什么？呵，八千年为春，八千年为冬，梦见的那些，也不过短 短几个秋，如此罢了。"]
-    prompt_tokens=["ling.npy"]
-    generator = main("真让人怀念，很多年前，我也曾如今天这般走入那谋臣似雨的阁楼。", prompt_text, prompt_tokens, output_dir="./output/ling/1/")
-    for buffer in generator:
-        print(len(buffer))
-
-    prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
-    prompt_tokens = ["surtr.npy"]
-
-    generator = main("他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。", prompt_text, prompt_tokens, output_dir="./output/surtr/2/")
-    for buffer in generator:
-        print(len(buffer))
-
-    # generator = main("私がここに留まってるのは必要だからじゃない、そうしたいからだ。", prompt_text, prompt_tokens, output_dir="./output/surtr/3/")
+    # prompt_text=["昨夜我梦见了你，不！兴许是你梦见了我。唔，记不得了？可惜，那般得意，却不能与人同享。得意什么？呵，八千年为春，八千年为冬，梦见的那些，也不过短 短几个秋，如此罢了。"]
+    # prompt_tokens=["ling.npy"]
+    # generator = main("真让人怀念，很多年前，我也曾如今天这般走入那谋臣似雨的阁楼。", prompt_text, prompt_tokens, output_dir="./output/ling/1/")
     # for buffer in generator:
     #     print(len(buffer))
 
+    prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
+    prompt_tokens = ["surtr.npy"]
+    generator = main("他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。", prompt_text, prompt_tokens, output_dir="./output/surtr/2/")
+    for buffer in generator:
+        print(len(buffer))
+    # generator = main("私がここに留まってるのは必要だからじゃない、そうしたいからだ。", prompt_text, prompt_tokens, output_dir="./output/surtr/3/")
+    # for buffer in generator:
+    #     print(len(buffer))
     # generator = main("何でもすぐどうしてって聞く奴が一番ムカつく。あんたがそうじゃないことを願うよ。", prompt_text, prompt_tokens, output_dir="./output/surtr/4/")
     # for buffer in generator:
     #     print(len(buffer))
