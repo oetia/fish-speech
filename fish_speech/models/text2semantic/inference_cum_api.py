@@ -1,180 +1,3 @@
-import argparse
-parser = argparse.ArgumentParser(description="Run something mediocre.")
-parser.add_argument("--checkpoint-path", type=str)
-parser.add_argument("--device", type=str, default="cuda")
-parser.add_argument("--compile", dest="compile", action="store_true")
-parser.add_argument("--no-compile", dest="compile", action="store_false")
-parser.add_argument("--half", dest="compile", action="store_true")
-parser.add_argument("--output-base-dir", type=str, default="./output")
-parser.set_defaults(half=False)
-args = parser.parse_args()
-print(args)
-print("sanity check")
-
-
-
-
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.exceptions import HTTPException
-from typing import Literal
-from pydantic import BaseModel, Field
-from io import BytesIO
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    # allow_origins=["http://127.0.0.1:7997"],
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-
-
-
-
-from pathlib import Path
-
-import click
-import hydra
-import numpy as np
-import pyrootutils
-import soundfile as sf
-import torch
-import torchaudio
-from hydra import compose, initialize
-from hydra.utils import instantiate
-from loguru import logger
-from omegaconf import OmegaConf
-import time
-import math
-from pydub import AudioSegment
-import os
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
-
-from fish_speech.utils.file import AUDIO_EXTENSIONS
-
-# register eval resolver
-OmegaConf.register_new_resolver("eval", eval)
-
-
-
-def load_model_vqgan(config_name: str, checkpoint_path: str, device="cuda"):
-    hydra.core.global_hydra.GlobalHydra.instance().clear()
-    with initialize(version_base="1.3", config_path="../../configs"):
-        cfg = compose(config_name=config_name)
-
-    model = instantiate(cfg)
-    state_dict = torch.load(
-        checkpoint_path, map_location=device, mmap=True, weights_only=True
-    )
-    if "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
-
-    if any("generator" in k for k in state_dict):
-        state_dict = {
-            k.replace("generator.", ""): v
-            for k, v in state_dict.items()
-            if "generator." in k
-        }
-
-    result = model.load_state_dict(state_dict, strict=False, assign=True)
-    model.eval()
-    model.to(device)
-
-    logger.info(f"Loaded model: {result}")
-    return model
-
-
-logger.info("Loading VQGAN ...")
-t0 = time.time()
-model_vqgan = load_model_vqgan(
-    "firefly_gan_vq", 
-    os.path.join(args.checkpoint_path, "firefly-gan-vq-fsq-8x1024-21hz-generator.pth"), 
-    device=args.device
-)
-logger.info(f"Loaded VQGAN in {time.time() - t0:2f}")
-
-
-@torch.no_grad()
-def vqgan_inference(
-    indices: torch.Tensor, # grouped finite scalar vector quantization encoded (8,n)
-):
-    logger.info(f"Decoding start")
-    start = time.time()
-    feature_lengths = torch.tensor([indices.shape[1]], device=args.device)
-    fake_audios, _ = model_vqgan.decode(
-        indices=indices[None], feature_lengths=feature_lengths
-    )
-    audio_time = fake_audios.shape[-1] / model_vqgan.spec_transform.sample_rate
-    end = time.time()
-    logger.info(f"Decoding end: time taken: {end - start:3f} seconds")
-    logger.info(
-        f"Generated audio of shape {fake_audios.shape}, equivalent to {audio_time:.10f} seconds from {indices.shape[1]} features, features/second: {indices.shape[1] / audio_time:.2f}"
-    )
-    fake_audio = fake_audios[0, 0].float().cpu().numpy()
-    return fake_audio
-
-
-def inference_save_get_stream(
-    indices: torch.Tensor,
-    splice_start: int, # inclusive
-    splice_end: int, # exclusive
-    output_dir: str,
-    upsample_factor: int = 2048,
-):
-    cum_audio = vqgan_inference(indices)
-    cum_output_path = os.path.join(output_dir, f"cum-{splice_start}-{splice_end}.wav")
-    sf.write(cum_output_path, cum_audio, model_vqgan.spec_transform.sample_rate)
-    logger.info(f"Saved CUM audio to {cum_output_path}")
-
-    cumnew_audio = cum_audio[splice_start*upsample_factor:splice_end*upsample_factor]
-    cumnew_output_path = os.path.join(output_dir, f"cumnew-{splice_start}-{splice_end}.wav")
-    sf.write(cumnew_output_path, cumnew_audio, model_vqgan.spec_transform.sample_rate)
-    logger.info(f"Saved CUMNEW audio to {cumnew_output_path}")
-
-    onlynew_audio = vqgan_inference(indices[:, splice_start:splice_end])
-    onlynew_output_path = os.path.join(output_dir, f"onlynew-{splice_start}-{splice_end}.wav")
-    sf.write(onlynew_output_path, onlynew_audio, model_vqgan.spec_transform.sample_rate)
-    logger.info(f"Saved ONLYNEW audio to {onlynew_output_path}")
-
-    return cumnew_audio
-
-
-def combine_outputs(output_dir: str) -> None:
-    # check quality of stitching together vqgan outputs without postprocessing
-    # compare between providing past (already streamed) tokens and only new tokens
-    contents = os.listdir(output_dir)
-
-    def combine_wavs(tag: str):
-        filtered_wavs = list(filter(lambda x: x.startswith(tag), contents))
-        sorted_wavs = sorted(filtered_wavs, key=lambda x: int(x.split(".")[0].split("-")[1]))
-        mapped_wavs = list(map(lambda x: os.path.join(output_dir, x), sorted_wavs))
-        logger.info(f"Combining wav files: {mapped_wavs}")
-        combined = AudioSegment.empty()
-        for wav in mapped_wavs:
-            audio = AudioSegment.from_wav(wav)
-            combined += audio  # Append
-        output_path = os.path.join(output_dir, f"_{tag}-combined.wav")
-        combined.export(output_path, format="wav")
-        logger.info(f"combined {tag} wav saved to {output_path}")
-    
-    combine_wavs("cumnew")
-    combine_wavs("onlynew")
-
-
-
-
-
-
-
-
 import os
 import queue
 import threading
@@ -485,12 +308,7 @@ def decode_one_token_ar(
     #     codebooks[1:, :], ~torch.isin(codebooks[:1, :], semantic_ids_tensor), CODEBOOK_PAD_TOKEN_ID
     # )
 
-    # each generation is 9 dimensional. since codebook is based off of grouped finite scalar quantization. 
-    # normally you'd have just prob over all tokens for a single codebook
-    # but in this case, since you have 9 codebooks, you need to have 9 prob distributions
-    # how does input work then? input still has to be a latent vector. latent vector assembled through concatenating 9 codebooks?
-    # yeah. guessing forward_generate creates concatenates sublatents into full latent vector
-    # print("codebook shape", codebooks.shape)
+    # print(codebooks)
     return codebooks
 
 
@@ -561,7 +379,6 @@ def decode_n_tokens(
             if torch.cuda.is_available()
             else nullcontext()
         ):  # Actually better for Inductor to codegen attention here
-            # print(cur_token.shape)
             next_token = decode_one_token(
                 model=model,
                 x=cur_token,
@@ -570,15 +387,8 @@ def decode_n_tokens(
                 semantic_ids=semantic_ids,
                 **sampling_kwargs,
             )
-            # print("decoded a token:", next_token.shape)
-            # technically this has 9 shape atm. the 1st dim is in the 10k's so i think it can probably be removed
-            # the inference_cum for vqgan is 8 dim. there's code in generate_long(), where the indexing of y is y[1:, ...]
-            # the first codebook is tossed
-            yield ("next_token", next_token)
 
         input_pos += 1
-        # print("input_pos", input_pos)
-        # print("previous tokens[0]", previous_tokens[:, 0])
         cur_token = next_token.view(1, model.config.num_codebooks + 1, -1)
         previous_tokens[:, i : i + 1] = next_token.view(
             model.config.num_codebooks + 1, -1
@@ -586,10 +396,8 @@ def decode_n_tokens(
 
         if cur_token[0, 0, -1] == model.tokenizer.get_token_id(IM_END_TOKEN):
             break
-    
-    print("previous tokens", previous_tokens.shape)
-    # return previous_tokens[:, : i + 1]
-    yield ("previous_token", previous_tokens[:, : i + 1])
+
+    return previous_tokens[:, : i + 1]
 
 
 @torch.no_grad()
@@ -601,7 +409,7 @@ def generate(
     max_new_tokens: int,
     decode_one_token=decode_one_token_naive,
     **sampling_kwargs,
-):
+) -> torch.Tensor:
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
@@ -648,14 +456,10 @@ def generate(
         semantic_ids=semantic_ids,
         **sampling_kwargs,
     )
-
     seq[:, T : T + 1] = next_token
-    print(next_token.shape)
-    print(seq.shape)
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
-    # x = decode_n_tokens(
-    x_generator = decode_n_tokens(
+    x = decode_n_tokens(
         model,
         next_token.view(1, codebook_dim, -1),
         input_pos,
@@ -664,21 +468,11 @@ def generate(
         semantic_ids=semantic_ids,
         **sampling_kwargs,
     )
+    # x = torch.cat(generated_tokens, dim=1)
+    seq = seq[:, : T + 1 + x.size(1)]
+    seq[:, T + 1 :] = x
 
-    for x_gen in x_generator:
-        # print("xgen sanitycheck")
-        if x_gen[0] == "previous_token": # default functionality
-            seq = seq[:, : T + 1 + x_gen[1].size(1)]
-            seq[:, T + 1 :] = x_gen[1]
-            yield ("seq", seq)
-        elif x_gen[0] == "next_token": # keep passing it up
-            yield x_gen
-
-    # # x = torch.cat(generated_tokens, dim=1)
-    # seq = seq[:, : T + 1 + x.size(1)]
-    # seq[:, T + 1 :] = x
-    # return seq
-
+    return seq
 
 
 def decode_n_tokens_agent(
@@ -879,7 +673,7 @@ def encode_tokens(
     return encoded.to(device)
 
 
-def load_model_llm(checkpoint_path, device, precision, compile=False, is_agent=False):
+def load_model(checkpoint_path, device, precision, compile=False, is_agent=False):
     model: Union[NaiveTransformer, DualARTransformer] = BaseTransformer.from_pretrained(
         checkpoint_path, load_weights=True, is_agent=is_agent
     )
@@ -1003,7 +797,6 @@ def generate_long(
     )
 
     for sample_idx in range(num_samples):
-
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -1045,8 +838,7 @@ def generate_long(
             prompt_length = cat_encoded.size(1)
 
             t0 = time.perf_counter()
-            # y = generate(
-            y_generator = generate(
+            y = generate(
                 model=model,
                 prompt=cat_encoded,
                 max_new_tokens=max_new_tokens,
@@ -1056,47 +848,41 @@ def generate_long(
                 repetition_penalty=repetition_penalty,
             )
 
-            for y_gen in y_generator:
-                # print("ygen sanity check")
-                if y_gen[0] == "seq":
-                    y = y_gen[1]
-                    if sample_idx == 0 and seg_idx == 0 and compile:
-                        logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
+            if sample_idx == 0 and seg_idx == 0 and compile:
+                logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
 
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
 
-                    t = time.perf_counter() - t0
+            t = time.perf_counter() - t0
 
-                    tokens_generated = y.size(1) - prompt_length
-                    tokens_sec = tokens_generated / t
-                    logger.info(
-                        f"Generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
-                    )
-                    logger.info(
-                        f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s"
-                    )
+            tokens_generated = y.size(1) - prompt_length
+            tokens_sec = tokens_generated / t
+            logger.info(
+                f"Generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
+            )
+            logger.info(
+                f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s"
+            )
 
-                    if torch.cuda.is_available():
-                        logger.info(
-                            f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
-                        )
+            if torch.cuda.is_available():
+                logger.info(
+                    f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
+                )
 
-                    # Put the generated tokens
-                    # since there is <im_end>, we remove last token
-                    codes = y[1:, prompt_length + 1 :].clone()
-                    assert (codes >= 0).all(), f"Negative code found"
+            # Put the generated tokens
+            # since there is <im_end>, we remove last token
+            codes = y[1:, prompt_length + 1 :].clone()
+            assert (codes >= 0).all(), f"Negative code found"
 
-                    decoded = y[:, prompt_length:].clone()
-                    # But for global encoding, we should keep the <im_end> token
+            decoded = y[:, prompt_length:].clone()
+            # But for global encoding, we should keep the <im_end> token
 
-                    global_encoded.append(decoded)
-                    assert (codes >= 0).all(), f"Negative code found: {codes}"
-                    yield GenerateResponse(action="sample", codes=codes, text=texts[seg_idx])
-                    seg_idx += 1
-                elif y_gen[0] == "next_token":
-                    # print("ygen - yielded next token")
-                    yield y_gen
+            global_encoded.append(decoded)
+            assert (codes >= 0).all(), f"Negative code found: {codes}"
+            yield GenerateResponse(action="sample", codes=codes, text=texts[seg_idx])
+            seg_idx += 1
+
         # This indicates the end of the current sample
         yield GenerateResponse(action="next")
 
@@ -1123,7 +909,7 @@ def launch_thread_safe_queue(
     init_event = threading.Event()
 
     def worker():
-        model, decode_one_token = load_model_llm(
+        model, decode_one_token = load_model(
             checkpoint_path, device, precision, compile=compile
         )
         with torch.device(device):
@@ -1171,7 +957,7 @@ def launch_thread_safe_queue_agent(
     config = BaseModelArgs.from_pretrained(checkpoint_path)
 
     def worker():
-        model, decode_one_token = load_model_llm(
+        model, decode_one_token = load_model(
             checkpoint_path, device, precision, compile=compile, is_agent=True
         )
 
@@ -1212,47 +998,77 @@ def launch_thread_safe_queue_agent(
     return input_queue, tokenizer, config
 
 
-logger.info("Loading model LLM ...")
-t0 = time.time()
-precision = torch.half if args.half else torch.bfloat16
-model_llm, decode_one_token = load_model_llm(
-    args.checkpoint_path, args.device, precision, compile=args.compile
+@click.command()
+@click.option(
+    "--text",
+    type=str,
+    default="你说的对, 但是原神是一款由米哈游自主研发的开放世界手游.",
 )
-with torch.device(args.device):
-    model_llm.setup_caches(
-        max_batch_size=1,
-        max_seq_len=model_llm.config.max_seq_len,
-        dtype=next(model_llm.parameters()).dtype,
-    )
-if torch.cuda.is_available():
-    torch.cuda.synchronize()
-logger.info(f"Time to load model: {time.time() - t0:.02f} seconds")
-
-
+@click.option("--prompt-text", type=str, default=None, multiple=True)
+@click.option(
+    "--prompt-tokens",
+    type=click.Path(path_type=Path, exists=True),
+    default=None,
+    multiple=True,
+)
+@click.option("--num-samples", type=int, default=1)
+@click.option("--max-new-tokens", type=int, default=0)
+@click.option("--top-p", type=float, default=0.7)
+@click.option("--repetition-penalty", type=float, default=1.2)
+@click.option("--temperature", type=float, default=0.7)
+@click.option(
+    "--checkpoint-path",
+    type=click.Path(path_type=Path, exists=True),
+    default="checkpoints/fish-speech-1.5",
+)
+@click.option("--device", type=str, default="cuda")
+@click.option("--compile/--no-compile", default=False)
+@click.option("--seed", type=int, default=42)
+@click.option("--half/--no-half", default=False)
+@click.option("--iterative-prompt/--no-iterative-prompt", default=True)
+@click.option("--chunk-length", type=int, default=100)
+@click.option("--output-dir", type=Path, default="temp")
 def main(
     text: str,
-    prompt_text: Optional[list[str]], # TODO: replace with prompt_dir in the future
+    prompt_text: Optional[list[str]],
     prompt_tokens: Optional[list[Path]],
+    num_samples: int,
+    max_new_tokens: int,
+    top_p: int,
+    repetition_penalty: float,
+    temperature: float,
+    checkpoint_path: Path,
+    device: str,
+    compile: bool,
+    seed: int,
+    half: bool,
+    iterative_prompt: bool,
+    chunk_length: int,
     output_dir: Path,
-    num_samples: int = 1,
-    max_new_tokens: int = 0,
-    top_p: float = 0.7,
-    repetition_penalty: float = 1.2,
-    temperature: float = 0.7,
-    checkpoint_path: Path = args.checkpoint_path,
-    device: str = args.device,
-    compile: bool = args.compile,
-    seed: int = 16,
-    half: bool = args.half,
-    iterative_prompt: bool = True,
-    chunk_length: int = 100,
-):
+) -> None:
     os.makedirs(output_dir, exist_ok=True)
+    precision = torch.half if half else torch.bfloat16
 
     if prompt_text is not None and len(prompt_text) != len(prompt_tokens):
         raise ValueError(
             f"Number of prompt text ({len(prompt_text)}) and prompt tokens ({len(prompt_tokens)}) should be the same"
         )
+
+    logger.info("Loading model ...")
+    t0 = time.time()
+    model, decode_one_token = load_model(
+        checkpoint_path, device, precision, compile=compile
+    )
+    with torch.device(device):
+        model.setup_caches(
+            max_batch_size=1,
+            max_seq_len=model.config.max_seq_len,
+            dtype=next(model.parameters()).dtype,
+        )
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    logger.info(f"Time to load model: {time.time() - t0:.02f} seconds")
 
     if prompt_tokens is not None:
         prompt_tokens = [torch.from_numpy(np.load(p)).to(device) for p in prompt_tokens]
@@ -1262,8 +1078,9 @@ def main(
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
 
+
     generator = generate_long(
-        model=model_llm,
+        model=model,
         device=device,
         decode_one_token=decode_one_token,
         text=text,
@@ -1280,151 +1097,32 @@ def main(
     )
 
     idx = 0
-    codes = [] # contains token chunks - default behavior
-    tokens = [] # contains individual tokens - custom behavior w. streaming
-    last_stream_end = 0 # token the last stream to client ended on
+    codes = []
 
     print("starting generation")
     start = time.time()
     for response in generator:
-        # print("response sanitycheck", response)
-        # print(response)
-        if isinstance(response, GenerateResponse):
-            if response.action == "sample":
-                codes.append(response.codes)
-                logger.info(f"Sampled text: {response.text}")
-            elif response.action == "next":
-                if codes:
-                    codes_npy_path = os.path.join(output_dir, f"codes_{idx}.npy")
-                    np.save(codes_npy_path, torch.cat(codes, dim=1).cpu().numpy())
-                    logger.info(f"Saved codes to {codes_npy_path}")
-                    print("torch final dim: ", torch.cat(codes, dim=1).shape)
-
-                    tokens_array = torch.cat(tokens, dim=1)
-                    print(tokens_array.shape)
-                    cumnew_audio = inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
-                    last_stream_end = len(tokens)
-                    # buffer = BytesIO()
-                    # sf.write(buffer, cumnew_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
-                    # buffer.seek(0)
-                    # yield buffer.read()
-
-                    logger.info("cumnew audio shape, min, max: ", cumnew_audio.shape, cumnew_audio.min(), cumnew_audio.max())
-                    audio_int16 = (cumnew_audio * 32767).astype(np.int16)  # Convert to 16-bit PCM
-                    audio_segment = AudioSegment(
-                        audio_int16.tobytes(),
-                        frame_rate=model_vqgan.spec_transform.sample_rate,
-                        sample_width=2,  # 16-bit = 2 bytes
-                        channels=1  # Assuming mono; use 2 for stereo
-                    )
-                    # Export as MP3 to a buffer
-                    buffer = BytesIO()
-                    audio_segment.export(buffer, format="mp3")
-                    buffer.seek(0)
-                    yield buffer.read()
-
-                logger.info(f"Next sample")
-                codes = []
-                idx += 1
-            else:
-                logger.error(f"Error: {response}")
+        if response.action == "sample":
+            codes.append(response.codes)
+            logger.info(f"Sampled text: {response.text}")
+        elif response.action == "next":
+            if codes:
+                codes_npy_path = os.path.join(output_dir, f"codes_{idx}.npy")
+                np.save(codes_npy_path, torch.cat(codes, dim=1).cpu().numpy())
+                logger.info(f"Saved codes to {codes_npy_path}")
+            logger.info(f"Next sample")
+            codes = []
+            idx += 1
         else:
-            if response[0] == "next_token":
-                tokens.append(response[1][1:, :])
-                # if len(tokens) % 50 == 0: # streaming rate
-                if len(tokens) % 100 == 0: # streaming rate
-                    tokens_array = torch.cat(tokens, dim=1)
-                    print(tokens_array.shape)
-                    cumnew_audio = inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
-                    last_stream_end = len(tokens)
-                    # wav unsupported by mediasource in browser
-                    # buffer = BytesIO()
-                    # sf.write(buffer, cumnew_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
-                    # buffer.seek(0)
-                    # yield buffer.read()
-
-                    # Convert numpy array to AudioSegment
-                    # Assuming cumnew_audio is a 1D numpy array of floats in [-1, 1]
-                    audio_int16 = (cumnew_audio * 32767).astype(np.int16)  # Convert to 16-bit PCM
-                    audio_segment = AudioSegment(
-                        audio_int16.tobytes(),
-                        frame_rate=model_vqgan.spec_transform.sample_rate,
-                        sample_width=2,  # 16-bit = 2 bytes
-                        channels=1  # Assuming mono; use 2 for stereo
-                    )
-                    # Export as MP3 to a buffer
-                    buffer = BytesIO()
-                    audio_segment.export(buffer, format="mp3")
-                    buffer.seek(0)
-                    yield buffer.read()
-
-    combine_outputs(output_dir)
-
+            logger.error(f"Error: {response}")
     end = time.time()
     print(f"finished generation: time taken: {end - start}")
 
 
-# if __name__ == "__main__":
-#     prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
-#     prompt_tokens = ["surtr.npy"]
-
-#     generator = main("他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。", prompt_text, prompt_tokens, output_dir="./output/surtr/2/")
-#     for buffer in generator:
-#         print(len(buffer))
-
-#     generator = main("私がここに留まってるのは必要だからじゃない、そうしたいからだ。", prompt_text, prompt_tokens, output_dir="./output/surtr/3/")
-#     for buffer in generator:
-#         print(len(buffer))
-
-#     generator = main("何でもすぐどうしてって聞く奴が一番ムカつく。あんたがそうじゃないことを願うよ。", prompt_text, prompt_tokens, output_dir="./output/surtr/4/")
-#     for buffer in generator:
-#         print(len(buffer))
-
-
-
-class FishRequest(BaseModel):
-    name: str = Field(
-        ...,
-        max_length=50,
-        pattern=r'^[a-zA-Z0-9]+$'
-    )
-    tts_text: str
-    personality: Literal["ling", "chen", "surtr"] = "ling"
-@app.post("/tts/stream")
-async def tts_stream(request: FishRequest):
-    text = "他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。"
-    prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
-    prompt_tokens = ["surtr.npy"]
-
-    output_dir = os.path.join(args.output_base_dir, request.name)
-    os.makedirs(output_dir, exist_ok=True)
-    logger.info(f"output dir {output_dir}")
-
-    try:
-        return StreamingResponse(
-            main(request.tts_text, prompt_text, prompt_tokens, output_dir),
-            media_type="audio/mpeg"
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
 if __name__ == "__main__":
+    main()
 
-    prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
-    prompt_tokens = ["surtr.npy"]
 
-    generator = main("他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。", prompt_text, prompt_tokens, output_dir="./output/surtr/2/")
-    for buffer in generator:
-        print(len(buffer))
 
-    generator = main("私がここに留まってるのは必要だからじゃない、そうしたいからだ。", prompt_text, prompt_tokens, output_dir="./output/surtr/3/")
-    for buffer in generator:
-        print(len(buffer))
-
-    generator = main("何でもすぐどうしてって聞く奴が一番ムカつく。あんたがそうじゃないことを願うよ。", prompt_text, prompt_tokens, output_dir="./output/surtr/4/")
-    for buffer in generator:
-        print(len(buffer))
-
-    import uvicorn
-    print("Starting server... Imports loaded.")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+# api call
+# 

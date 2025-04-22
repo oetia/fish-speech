@@ -5,11 +5,14 @@ parser.add_argument("--device", type=str, default="cuda")
 parser.add_argument("--compile", dest="compile", action="store_true")
 parser.add_argument("--no-compile", dest="compile", action="store_false")
 parser.add_argument("--half", dest="compile", action="store_true")
-parser.add_argument("--output-base-path", type=str, default="./output")
+parser.add_argument("--output-base-dir", type=str, default="./output")
 parser.set_defaults(half=False)
 args = parser.parse_args()
 print(args)
 print("sanity check")
+
+
+
 
 
 from fastapi import FastAPI
@@ -28,7 +31,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 
 
@@ -60,6 +62,7 @@ from fish_speech.utils.file import AUDIO_EXTENSIONS
 
 # register eval resolver
 OmegaConf.register_new_resolver("eval", eval)
+
 
 
 def load_model_vqgan(config_name: str, checkpoint_path: str, device="cuda"):
@@ -136,7 +139,7 @@ def inference_save_get_stream(
     sf.write(cumnew_output_path, cumnew_audio, model_vqgan.spec_transform.sample_rate)
     logger.info(f"Saved CUMNEW audio to {cumnew_output_path}")
 
-    onlynew_audio = vqgan_inference(indices[splice_start:splice_end])
+    onlynew_audio = vqgan_inference(indices[:, splice_start:splice_end])
     onlynew_output_path = os.path.join(output_dir, f"onlynew-{splice_start}-{splice_end}.wav")
     sf.write(onlynew_output_path, onlynew_audio, model_vqgan.spec_transform.sample_rate)
     logger.info(f"Saved ONLYNEW audio to {onlynew_output_path}")
@@ -148,28 +151,24 @@ def combine_outputs(output_dir: str) -> None:
     # check quality of stitching together vqgan outputs without postprocessing
     # compare between providing past (already streamed) tokens and only new tokens
     contents = os.listdir(output_dir)
-    
-    cumnew_wavs = list(filter(lambda x: x.startswith("cumnew"), contents))
-    sorted_cumnew = sorted(cumnew_wavs, key=lambda x: int(x.split(".")[0].split("-")[1]))
-    logger.info(f"Combining wav files: {sorted_cumnew}")
-    cumnew_combined = AudioSegment.empty()
-    for wav in sorted_cumnew:
-        audio = AudioSegment.from_wav(wav)
-        cumnew_combined += audio  # Append
-    cumnew_output_path = os.path.join(output_dir, "_cumnew-combined.wav")
-    cumnew_combined.export(cumnew_output_path, format="wav")
-    logger.info(f"Combined wav saved to {cumnew_output_path}")
 
-    onlynew_wavs = list(filter(lambda x: x.startswith("onlynew"), contents))
-    sorted_onlynew = sorted(onlynew_wavs, key=lambda x: int(x.split(".")[0].split("-")[1]))
-    logger.info(f"Combining wav files: {sorted_onlynew}")
-    onlynew_combined = AudioSegment.empty()
-    for wav in sorted_onlynew:
-        audio = AudioSegment.from_wav(wav)
-        onlynew_combined += audio  # Append
-    onlynew_output_path = os.path.join(output_dir, "_cumnew-combined.wav")
-    onlynew_combined.export(onlynew_output_path, format="wav")
-    logger.info(f"Combined wav saved to {onlynew_output_path}")
+    def combine_wavs(tag: str):
+        filtered_wavs = list(filter(lambda x: x.startswith(tag), contents))
+        sorted_wavs = sorted(filtered_wavs, key=lambda x: int(x.split(".")[0].split("-")[1]))
+        mapped_wavs = list(map(lambda x: os.path.join(output_dir, x), sorted_wavs))
+        logger.info(f"Combining wav files: {mapped_wavs}")
+        combined = AudioSegment.empty()
+        for wav in mapped_wavs:
+            audio = AudioSegment.from_wav(wav)
+            combined += audio  # Append
+        output_path = os.path.join(output_dir, f"_{tag}-combined.wav")
+        combined.export(output_path, format="wav")
+        logger.info(f"combined {tag} wav saved to {output_path}")
+    
+    combine_wavs("cumnew")
+    combine_wavs("onlynew")
+
+
 
 
 
@@ -667,7 +666,7 @@ def generate(
     )
 
     for x_gen in x_generator:
-        print("xgen sanitycheck")
+        # print("xgen sanitycheck")
         if x_gen[0] == "previous_token": # default functionality
             seq = seq[:, : T + 1 + x_gen[1].size(1)]
             seq[:, T + 1 :] = x_gen[1]
@@ -926,7 +925,7 @@ def generate_long(
     text: str,
     num_samples: int = 1,
     max_new_tokens: int = 0,
-    top_p: float = 0.7,
+    top_p: int = 0.7,
     repetition_penalty: float = 1.5,
     temperature: float = 0.7,
     compile: bool = False,
@@ -1004,7 +1003,7 @@ def generate_long(
     )
 
     for sample_idx in range(num_samples):
-        print(sample_idx)
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -1058,7 +1057,7 @@ def generate_long(
             )
 
             for y_gen in y_generator:
-                print("ygen sanity check")
+                # print("ygen sanity check")
                 if y_gen[0] == "seq":
                     y = y_gen[1]
                     if sample_idx == 0 and seg_idx == 0 and compile:
@@ -1096,7 +1095,7 @@ def generate_long(
                     yield GenerateResponse(action="sample", codes=codes, text=texts[seg_idx])
                     seg_idx += 1
                 elif y_gen[0] == "next_token":
-                    print("ygen - yielded next token")
+                    # print("ygen - yielded next token")
                     yield y_gen
         # This indicates the end of the current sample
         yield GenerateResponse(action="next")
@@ -1213,10 +1212,11 @@ def launch_thread_safe_queue_agent(
     return input_queue, tokenizer, config
 
 
-logger.info("Loading LLM ...")
+logger.info("Loading model LLM ...")
 t0 = time.time()
+precision = torch.half if args.half else torch.bfloat16
 model_llm, decode_one_token = load_model_llm(
-    args.checkpoint_path, args.device, torch.half if args.half else torch.bfloat16, compile=args.compile
+    args.checkpoint_path, args.device, precision, compile=args.compile
 )
 with torch.device(args.device):
     model_llm.setup_caches(
@@ -1226,69 +1226,27 @@ with torch.device(args.device):
     )
 if torch.cuda.is_available():
     torch.cuda.synchronize()
-logger.info(f"Time to load LLM: {time.time() - t0:.02f} seconds")
+logger.info(f"Time to load model: {time.time() - t0:.02f} seconds")
 
 
-def generate_audio_chunks(
+def main(
     text: str,
     prompt_text: Optional[list[str]], # TODO: replace with prompt_dir in the future
     prompt_tokens: Optional[list[Path]],
-    output_dir: str,
+    output_dir: Path,
     num_samples: int = 1,
     max_new_tokens: int = 0,
     top_p: float = 0.7,
     repetition_penalty: float = 1.2,
     temperature: float = 0.7,
+    checkpoint_path: Path = args.checkpoint_path,
     device: str = args.device,
     compile: bool = args.compile,
     seed: int = 16,
+    half: bool = args.half,
     iterative_prompt: bool = True,
     chunk_length: int = 100,
 ):
-    print(text)
-    os.makedirs(output_dir, exist_ok=True)
-
-    if prompt_text is not None and len(prompt_text) != len(prompt_tokens):
-        raise ValueError(f"Number of prompt text ({len(prompt_text)}) and prompt tokens ({len(prompt_tokens)}) should be the same")
-    if prompt_tokens is not None:
-        prompt_tokens = [torch.from_numpy(np.load(p)).to(device) for p in prompt_tokens]
-
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-    
-    generator = generate_long(
-        model=model_llm,
-        device=device,
-        decode_one_token=decode_one_token,
-        text=text,
-        num_samples=num_samples,
-        max_new_tokens=max_new_tokens,
-        top_p=top_p,
-        repetition_penalty=repetition_penalty,
-        temperature=temperature,
-        compile=compile,
-        iterative_prompt=iterative_prompt,
-        chunk_length=chunk_length,
-        prompt_text=prompt_text,
-        prompt_tokens=prompt_tokens,
-    )
-
-def generate_audio_chunks2(
-    text: str,
-    prompt_text: Optional[list[str]], # TODO: replace with prompt_dir in the future
-    prompt_tokens: Optional[list[Path]],
-    output_dir: str,
-    num_samples: int = 1,
-    max_new_tokens: int = 0,
-    top_p: float = 0.7,
-    repetition_penalty: float = 1.2,
-    temperature: float = 0.7,
-    seed: int = 16,
-    iterative_prompt: bool = True,
-    chunk_length: int = 100,
-):
-    print("1")
     os.makedirs(output_dir, exist_ok=True)
 
     if prompt_text is not None and len(prompt_text) != len(prompt_tokens):
@@ -1300,12 +1258,13 @@ def generate_audio_chunks2(
         prompt_tokens = [torch.from_numpy(np.load(p)).to(device) for p in prompt_tokens]
 
     torch.manual_seed(seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
 
     generator = generate_long(
         model=model_llm,
-        device=args.device,
+        device=device,
         decode_one_token=decode_one_token,
         text=text,
         num_samples=num_samples,
@@ -1313,7 +1272,7 @@ def generate_audio_chunks2(
         top_p=top_p,
         repetition_penalty=repetition_penalty,
         temperature=temperature,
-        compile=args.compile,
+        compile=compile,
         iterative_prompt=iterative_prompt,
         chunk_length=chunk_length,
         prompt_text=prompt_text,
@@ -1343,6 +1302,27 @@ def generate_audio_chunks2(
 
                     tokens_array = torch.cat(tokens, dim=1)
                     print(tokens_array.shape)
+                    cumnew_audio = inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
+                    last_stream_end = len(tokens)
+                    # buffer = BytesIO()
+                    # sf.write(buffer, cumnew_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
+                    # buffer.seek(0)
+                    # yield buffer.read()
+
+                    logger.info("cumnew audio shape, min, max: ", cumnew_audio.shape, cumnew_audio.min(), cumnew_audio.max())
+                    audio_int16 = (cumnew_audio * 32767).astype(np.int16)  # Convert to 16-bit PCM
+                    audio_segment = AudioSegment(
+                        audio_int16.tobytes(),
+                        frame_rate=model_vqgan.spec_transform.sample_rate,
+                        sample_width=2,  # 16-bit = 2 bytes
+                        channels=1  # Assuming mono; use 2 for stereo
+                    )
+                    # Export as MP3 to a buffer
+                    buffer = BytesIO()
+                    audio_segment.export(buffer, format="mp3")
+                    buffer.seek(0)
+                    yield buffer.read()
+
                 logger.info(f"Next sample")
                 codes = []
                 idx += 1
@@ -1351,21 +1331,32 @@ def generate_audio_chunks2(
         else:
             if response[0] == "next_token":
                 tokens.append(response[1][1:, :])
-                if len(tokens) % 10 == 0: # on every tenth token do a generation
-                    # tokens_array = np.concatenate(tokens, axis=1)
+                # if len(tokens) % 50 == 0: # streaming rate
+                if len(tokens) % 100 == 0: # streaming rate
                     tokens_array = torch.cat(tokens, dim=1)
                     print(tokens_array.shape)
+                    cumnew_audio = inference_save_get_stream(tokens_array, last_stream_end, len(tokens), output_dir)
+                    last_stream_end = len(tokens)
+                    # wav unsupported by mediasource in browser
+                    # buffer = BytesIO()
+                    # sf.write(buffer, cumnew_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
+                    # buffer.seek(0)
+                    # yield buffer.read()
 
-                    new_audio = inference_save_get_stream(
-                        tokens_array,
-                        last_stream_end, len(tokens),
-                        "./temp"
+                    # Convert numpy array to AudioSegment
+                    # Assuming cumnew_audio is a 1D numpy array of floats in [-1, 1]
+                    audio_int16 = (cumnew_audio * 32767).astype(np.int16)  # Convert to 16-bit PCM
+                    audio_segment = AudioSegment(
+                        audio_int16.tobytes(),
+                        frame_rate=model_vqgan.spec_transform.sample_rate,
+                        sample_width=2,  # 16-bit = 2 bytes
+                        channels=1  # Assuming mono; use 2 for stereo
                     )
+                    # Export as MP3 to a buffer
                     buffer = BytesIO()
-                    sf.write(buffer, new_audio, model_vqgan.spec_transform.sample_rate, format="WAV")
+                    audio_segment.export(buffer, format="mp3")
                     buffer.seek(0)
                     yield buffer.read()
-                    last_stream_end = len(tokens)
 
     combine_outputs(output_dir)
 
@@ -1373,42 +1364,70 @@ def generate_audio_chunks2(
     print(f"finished generation: time taken: {end - start}")
 
 
-# class FishRequest(BaseModel):
-#     name: str = Field(
-#         ...,
-#         max_length=50,
-#         pattern=r'^[a-zA-Z0-9]+$'
-#     )
-#     tts_text: str
-#     personality: Literal["ling", "chen", "surtr"] = "ling"
-# @app.post("/tts/stream")
-# async def tts_stream(request: FishRequest):
-#     text = "他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。"
-#     prompt_text = "あんた、自分の仕事も全うできないからって、私に助けろっていうの？"
-#     prompt_tokens = "surtr.npy"
-
-#     output_dir = os.path.join(args.output_base_path, request.name)
-#     os.makedirs(output_dir)
-
-#     try:
-#         return StreamingResponse(
-#             generate_audio_chunks(text, prompt_text, prompt_tokens, output_dir),
-#             media_type="audio/wav"
-#         )
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
-text = "他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。"
-prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
-prompt_tokens = ["surtr.npy"]
-
-print("0")
-
-generate_audio_chunks(text, prompt_text, prompt_tokens, output_dir="./output/temp")
-
-print("2")
 # if __name__ == "__main__":
-#     import uvicorn
-#     print("Starting server... Imports loaded.")
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
+#     prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
+#     prompt_tokens = ["surtr.npy"]
+
+#     generator = main("他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。", prompt_text, prompt_tokens, output_dir="./output/surtr/2/")
+#     for buffer in generator:
+#         print(len(buffer))
+
+#     generator = main("私がここに留まってるのは必要だからじゃない、そうしたいからだ。", prompt_text, prompt_tokens, output_dir="./output/surtr/3/")
+#     for buffer in generator:
+#         print(len(buffer))
+
+#     generator = main("何でもすぐどうしてって聞く奴が一番ムカつく。あんたがそうじゃないことを願うよ。", prompt_text, prompt_tokens, output_dir="./output/surtr/4/")
+#     for buffer in generator:
+#         print(len(buffer))
+
+
+
+class FishRequest(BaseModel):
+    name: str = Field(
+        ...,
+        max_length=50,
+        pattern=r'^[a-zA-Z0-9]+$'
+    )
+    tts_text: str
+    personality: Literal["ling", "chen", "surtr"] = "ling"
+@app.post("/tts/stream")
+async def tts_stream(request: FishRequest):
+    text = "他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。"
+
+    prompt_text = ["昨夜我梦见了你，不！兴许是你梦见了我。唔，记不得了？可惜，那般得意，却不能与人同享。得意什么？呵，八千年为春，八千年为冬，梦见的那些，也不过短短几个秋，如此罢了。"]
+    prompt_tokens = ["ling.npy"]
+    # prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
+    # prompt_tokens = ["surtr.npy"]
+
+    output_dir = os.path.join(args.output_base_dir, request.name)
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"output dir {output_dir}")
+
+    try:
+        return StreamingResponse(
+            main(request.tts_text, prompt_text, prompt_tokens, output_dir),
+            media_type="audio/mpeg"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+if __name__ == "__main__":
+
+    prompt_text = ["あんた、自分の仕事も全うできないからって、私に助けろっていうの？"]
+    prompt_tokens = ["surtr.npy"]
+
+    generator = main("他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。", prompt_text, prompt_tokens, output_dir="./output/surtr/2/")
+    for buffer in generator:
+        print(len(buffer))
+
+    # generator = main("私がここに留まってるのは必要だからじゃない、そうしたいからだ。", prompt_text, prompt_tokens, output_dir="./output/surtr/3/")
+    # for buffer in generator:
+    #     print(len(buffer))
+
+    # generator = main("何でもすぐどうしてって聞く奴が一番ムカつく。あんたがそうじゃないことを願うよ。", prompt_text, prompt_tokens, output_dir="./output/surtr/4/")
+    # for buffer in generator:
+    #     print(len(buffer))
+
+    import uvicorn
+    print("Starting server... Imports loaded.")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
