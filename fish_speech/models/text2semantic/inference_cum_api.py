@@ -1451,6 +1451,32 @@ async def tts_stream(request: FishRequest):
             "./voice/chen/aceship/CN_009.npy",
             "./voice/chen/aceship/CN_010.npy",
         ]
+    elif request.personality == "surtr":
+        prompt_text = [
+            "あんた、自分の仕事も全うできないからって、私に助けろっていうの？",
+            "他人の指導役はもうごめんだ。一般人たちと雁首揃えてアーツごっこするなんて興味ない。",
+            "私がここに留まってるのは必要だからじゃない、そうしたいからだ。",
+            "何でもすぐどうしてって聞く奴が一番ムカつく。あんたがそうじゃないことを願うよ。",
+            "私のアーツを少しは理解できたようだな。ならばその危うさも覚えておくといいよ。",
+            "気がつくと、アーツの力もこのアーツユニットも手の中にあった。この力を手に入れた時のことは全く覚えてないが、もちろんそんなこと気にしたこともない。",
+            "私にはいろんな記憶がある。どうやってその記憶を宿したのか、どれが本物の自分の記憶なのか、全然わからない。その記憶の出どころを探し出すために国々を渡り歩いているが、今はロドスに落ち着いたところだ。",
+            "私を混乱する記憶の渦から救い出し落ち着かせてくれるのは、アイスクリームをおいて他にない。これまで一人だった頃は、いつも助けられていた。",
+            "ロドスでの記憶はこれまでと違ってすごくリアルな感じがして、自分が自分であることを初めて実感させてくれた。これも全部あんたやロドスのみんなのおかげだ。……何よ、感謝すべきことは私もちゃんと言うから。",
+            "チッ、時間の無駄。",
+        ]
+        prompt_tokens = [
+            "./voice/surtr/aceship/JP_001.npy",
+            "./voice/surtr/aceship/JP_002.npy",
+            "./voice/surtr/aceship/JP_003.npy",
+            "./voice/surtr/aceship/JP_004.npy",
+            "./voice/surtr/aceship/JP_005.npy",
+            "./voice/surtr/aceship/JP_006.npy",
+            "./voice/surtr/aceship/JP_007.npy",
+            "./voice/surtr/aceship/JP_008.npy",
+            "./voice/surtr/aceship/JP_009.npy",
+            "./voice/surtr/aceship/JP_010.npy",
+        ]
+
 
     output_dir = os.path.join(args.output_base_dir, request.name)
     os.makedirs(output_dir, exist_ok=True)
